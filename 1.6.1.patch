@@ -1,0 +1,524 @@
+diff --git a/1.6.1.patch b/1.6.1.patch
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/apisix/admin/example_resource_def.lua b/apisix/admin/example_resource_def.lua
+new file mode 100644
+index 00000000..124d9ef3
+--- /dev/null
++++ b/apisix/admin/example_resource_def.lua
+@@ -0,0 +1,169 @@
++--
++-- Example Resource Definition using DSL
++--
++
++local resource_generator = require("apisix.admin.resource_generator")
++
++local consumers_def = {
++    name = "consumers",
++    kind = "consumer",
++    schema = "core.schema.consumer",
++    return_id_field = "username",
++    imports = {
++        { name = "core", path = "apisix.core" },
++        { name = "plugins", path = "apisix.admin.plugins" },
++    },
++    custom_imports = {
++        "local plugins_encrypt_conf = require(\"apisix.admin.plugins\").encrypt_conf"
++    },
++    check_conf = {
++        { type = "schema" },
++        { 
++            type = "id_consistency", 
++            id_var = "id", 
++            conf_field = "username" 
++        },
++        { 
++            type = "plugins", 
++            module = "plugins", 
++            schema_type = "core.schema.TYPE_CONSUMER" 
++        },
++        { 
++            type = "reference_check", 
++            field = "group_id", 
++            resource = "consumer_groups", 
++            resource_desc = "consumer group" 
++        },
++    },
++    encrypt_conf = {
++        "plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)"
++    },
++    unsupported_methods = { "post", "patch" },
++}
++
++local routes_def = {
++    name = "routes",
++    kind = "route",
++    schema = "core.schema.route",
++    imports = {
++        { name = "core", path = "apisix.core" },
++        { name = "apisix_upstream", path = "apisix.upstream" },
++    },
++    custom_imports = {
++        "local schema_plugin = require(\"apisix.admin.plugins\").check_schema",
++        "local plugins_encrypt_conf = require(\"apisix.admin.plugins\").encrypt_conf",
++        "local expr = require(\"resty.expr.v1\")",
++        "local type = type",
++        "local loadstring = loadstring",
++        "local ipairs = ipairs",
++        "local jp = require(\"jsonpath\")",
++    },
++    custom_code_top = {
++        "local function validate_post_arg(node)",
++        "    if type(node) ~= \"table\" then",
++        "        return true",
++        "    end",
++        "    if #node >= 3 and type(node[1]) == \"string\" and node[1]:find(\"^post_arg%.\") then",
++        "        local key = node[1]",
++        "        local json_path = \"$.\" .. key:sub(11)",
++        "        local _, err = jp.parse(json_path)",
++        "        if err then",
++        "            return false, err",
++        "        end",
++        "        return true",
++        "    end",
++        "    for _, child in ipairs(node) do",
++        "        local ok, err = validate_post_arg(child)",
++        "        if not ok then",
++        "            return false, err",
++        "        end",
++        "    end",
++        "    return true",
++        "end",
++    },
++    check_conf = {
++        { type = "mutually_exclusive", a = "host", b = "hosts" },
++        { type = "mutually_exclusive", a = "remote_addr", b = "remote_addrs" },
++        { type = "schema" },
++        { type = "sub_schema", field = "upstream", module = "apisix_upstream" },
++        { 
++            type = "reference_check", 
++            field = "upstream_id", 
++            resource = "upstreams", 
++            resource_desc = "upstream" 
++        },
++        { 
++            type = "reference_check", 
++            field = "service_id", 
++            resource = "services", 
++            resource_desc = "service" 
++        },
++        { 
++            type = "reference_check", 
++            field = "plugin_config_id", 
++            resource = "plugin_configs", 
++            resource_desc = "plugin config" 
++        },
++        { 
++            type = "plugins", 
++            module = "schema_plugin" 
++        },
++        {
++            type = "custom",
++            code = {
++                "    if conf.vars then",
++                "        ok, err = expr.new(conf.vars)",
++                "        if not ok then",
++                "            return nil, {error_msg = \"failed to validate the 'vars' expression: \" .. err}",
++                "        end",
++                "    end",
++                "    ok, err = validate_post_arg(conf.vars)",
++                "    if not ok  then",
++                "        return nil, {error_msg = \"failed to validate the 'vars' expression: \" ..",
++                "                                    err}",
++                "    end",
++                "    if conf.filter_func then",
++                "        local func, err = loadstring(\"return \" .. conf.filter_func)",
++                "        if not func then",
++                "            return nil, {error_msg = \"failed to load 'filter_func' string: \"",
++                "                                     .. err}",
++                "        end",
++                "        if type(func()) ~= \"function\" then",
++                "            return nil, {error_msg = \"'filter_func' should be a function\"}",
++                "        end",
++                "    end",
++                "    if conf.script then",
++                "        local obj, err = loadstring(conf.script)",
++                "        if not obj then",
++                "            return nil, {error_msg = \"failed to load 'script' string: \"",
++                "                                     .. err}",
++                "        end",
++                "        if type(obj()) ~= \"table\" then",
++                "            return nil, {error_msg = \"'script' should be a Lua object\"}",
++                "        end",
++                "    end",
++            }
++        },
++    },
++    encrypt_conf = {
++        "apisix_upstream.encrypt_conf(conf.upstream)",
++        "plugins_encrypt_conf(conf.plugins)"
++    },
++    list_filter_fields = {
++        service_id = true,
++        upstream_id = true,
++    },
++}
++
++return {
++    consumers = consumers_def,
++    routes = routes_def,
++    generate = function(name)
++        if name == "consumers" then
++            return resource_generator.generate(consumers_def)
++        elseif name == "routes" then
++            return resource_generator.generate(routes_def)
++        end
++        return nil
++    end
++}
+diff --git a/apisix/admin/generate_test.lua b/apisix/admin/generate_test.lua
+new file mode 100644
+index 00000000..67501fc4
+--- /dev/null
++++ b/apisix/admin/generate_test.lua
+@@ -0,0 +1,46 @@
++--
++-- Test Resource Generator
++--
++
++local resource_generator = require("apisix.admin.resource_generator")
++
++local consumers_def = {
++    name = "consumers",
++    kind = "consumer",
++    schema = "core.schema.consumer",
++    return_id_field = "username",
++    imports = {
++        { name = "core", path = "apisix.core" },
++        { name = "plugins", path = "apisix.admin.plugins" },
++    },
++    custom_imports = {
++        "local plugins_encrypt_conf = require(\"apisix.admin.plugins\").encrypt_conf"
++    },
++    check_conf = {
++        { type = "schema" },
++        { 
++            type = "id_consistency", 
++            id_var = "id", 
++            conf_field = "username" 
++        },
++        { 
++            type = "plugins", 
++            module = "plugins", 
++            schema_type = "core.schema.TYPE_CONSUMER" 
++        },
++        { 
++            type = "reference_check", 
++            field = "group_id", 
++            resource = "consumer_groups", 
++            resource_desc = "consumer group" 
++        },
++    },
++    encrypt_conf = {
++        "plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)"
++    },
++    unsupported_methods = { "post", "patch" },
++}
++
++local code = resource_generator.generate(consumers_def)
++print("=== Generated consumers.lua ===")
++print(code)
+diff --git a/apisix/admin/generated_consumers_example.lua b/apisix/admin/generated_consumers_example.lua
+new file mode 100644
+index 00000000..a5dad2cf
+--- /dev/null
++++ b/apisix/admin/generated_consumers_example.lua
+@@ -0,0 +1,67 @@
++--
++-- Licensed to the Apache Software Foundation (ASF) under one or more
++-- contributor license agreements.  See the NOTICE file distributed with
++-- this work for additional information regarding copyright ownership.
++-- The ASF licenses this file to You under the Apache License, Version 2.0
++-- (the "License"); you may not use this file except in compliance with
++-- the License.  You may obtain a copy of the License at
++--
++--     http://www.apache.org/licenses/LICENSE-2.0
++--
++-- Unless required by applicable law or agreed to in writing, software
++-- distributed under the License is distributed on an "AS IS" BASIS,
++-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++-- See the License for the specific language governing permissions and
++-- limitations under the License.
++--
++
++local core = require("apisix.core")
++local plugins = require("apisix.admin.plugins")
++local resource = require("apisix.admin.resource")
++local plugins_encrypt_conf = require("apisix.admin.plugins").encrypt_conf
++
++local function check_conf(id, conf, need_id, schema, opts)
++    opts = opts or {}
++    local ok, err = core.schema.check(schema, conf)
++    if not ok then
++        return nil, {error_msg = "invalid configuration: " .. err}
++    end
++    if id and id ~= conf.username then
++        return nil, {error_msg = "wrong username" }
++    end
++    if conf.plugins then
++        local ok, err = plugins.check_schema(conf.plugins, core.schema.TYPE_CONSUMER)
++        if not ok then
++            return nil, {error_msg = "invalid plugins configuration: " .. err}
++        end
++    end
++    if conf.group_id and not opts.skip_references_check then
++        local key = "/consumer_groups/" .. conf.group_id
++        local res, err = core.etcd.get(key)
++        if not res then
++            return nil, {error_msg = "failed to fetch consumer group info by consumer group id [" .. conf.group_id .. "]: "
++                                  .. err}
++        end
++        if res.status ~= 200 then
++            return nil, {error_msg = "failed to fetch consumer group info by consumer group id [" .. conf.group_id .. "], "
++                                  .. "response code: " .. res.status}
++        end
++    end
++    return conf.username
++end
++
++local function encrypt_conf(id, conf)
++    plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
++end
++
++return resource.new({
++    name = "consumers",
++    kind = "consumer",
++    schema = core.schema.consumer,
++    checker = check_conf,
++    encrypt_conf = encrypt_conf,
++    unsupported_methods = {
++        [1] = "post",
++        [2] = "patch",
++    },
++})
+diff --git a/apisix/admin/resource_generator.lua b/apisix/admin/resource_generator.lua
+new file mode 100644
+index 00000000..f6fc469d
+--- /dev/null
++++ b/apisix/admin/resource_generator.lua
+@@ -0,0 +1,215 @@
++--
++-- Licensed to the Apache Software Foundation (ASF) under one or more
++-- contributor license agreements.  See the NOTICE file distributed with
++-- this work for additional information regarding copyright ownership.
++-- The ASF licenses this file to You under the Apache License, Version 2.0
++-- (the "License"); you may not use this file except in compliance with
++-- the License.  You may obtain a copy of the License at
++--
++--     http://www.apache.org/licenses/LICENSE-2.0
++--
++-- Unless required by applicable law or agreed to in writing, software
++-- distributed under the License is distributed on an "AS IS" BASIS,
++-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++-- See the License for the specific language governing permissions and
++-- limitations under the License.
++--
++
++-- Resource Generator: Generate complete resource modules from concise definitions
++
++local _M = {}
++
++local function table_to_lua(tbl, indent)
++    indent = indent or 0
++    local result = {}
++    local indent_str = string.rep("    ", indent)
++    
++    for k, v in pairs(tbl) do
++        local key
++        if type(k) == "string" then
++            if string.match(k, "^[a-zA-Z_][a-zA-Z0-9_]*$") then
++                key = k
++            else
++                key = string.format("[%q]", k)
++            end
++        else
++            key = string.format("[%s]", tostring(k))
++        end
++        
++        local val
++        if type(v) == "string" then
++            val = string.format("%q", v)
++        elseif type(v) == "table" then
++            val = table_to_lua(v, indent + 1)
++        else
++            val = tostring(v)
++        end
++        
++        table.insert(result, indent_str .. key .. " = " .. val)
++    end
++    
++    return "{\n" .. table.concat(result, ",\n") .. "\n" .. string.rep("    ", indent - 1) .. "}"
++end
++
++function _M.generate(def)
++    local lines = {}
++    
++    table.insert(lines, "--")
++    table.insert(lines, "-- Licensed to the Apache Software Foundation (ASF) under one or more")
++    table.insert(lines, "-- contributor license agreements.  See the NOTICE file distributed with")
++    table.insert(lines, "-- this work for additional information regarding copyright ownership.")
++    table.insert(lines, "-- The ASF licenses this file to You under the Apache License, Version 2.0")
++    table.insert(lines, "-- (the \"License\"); you may not use this file except in compliance with")
++    table.insert(lines, "-- the License.  You may obtain a copy of the License at")
++    table.insert(lines, "--")
++    table.insert(lines, "--     http://www.apache.org/licenses/LICENSE-2.0")
++    table.insert(lines, "--")
++    table.insert(lines, "-- Unless required by applicable law or agreed to in writing, software")
++    table.insert(lines, "-- distributed under the License is distributed on an \"AS IS\" BASIS,")
++    table.insert(lines, "-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.")
++    table.insert(lines, "-- See the License for the specific language governing permissions and")
++    table.insert(lines, "-- limitations under the License.")
++    table.insert(lines, "--")
++    
++    for _, import in ipairs(def.imports or {}) do
++        table.insert(lines, string.format("local %s = require(\"%s\")", import.name, import.path))
++    end
++    table.insert(lines, "local resource = require(\"apisix.admin.resource\")")
++    
++    if def.custom_imports then
++        for _, import in ipairs(def.custom_imports) do
++            table.insert(lines, import)
++        end
++    end
++    table.insert(lines, "")
++    
++    if def.custom_code_top then
++        for _, line in ipairs(def.custom_code_top) do
++            table.insert(lines, line)
++        end
++        table.insert(lines, "")
++    end
++    
++    if def.check_conf then
++        table.insert(lines, "local function check_conf(id, conf, need_id, schema, opts)")
++        table.insert(lines, "    opts = opts or {}")
++        
++        for _, check in ipairs(def.check_conf) do
++            if check.type == "schema" then
++                table.insert(lines, "    local ok, err = core.schema.check(schema, conf)")
++                table.insert(lines, "    if not ok then")
++                table.insert(lines, "        return nil, {error_msg = \"invalid configuration: \" .. err}")
++                table.insert(lines, "    end")
++            elseif check.type == "mutually_exclusive" then
++                table.insert(lines, string.format("    if conf.%s and conf.%s then", check.a, check.b))
++                table.insert(lines, string.format("        return nil, {error_msg = \"only one of %s or %s is allowed\"}", check.a, check.b))
++                table.insert(lines, "    end")
++            elseif check.type == "plugins" then
++                table.insert(lines, "    if conf.plugins then")
++                local plugin_type = check.schema_type or "core.schema.TYPE_CONSUMER"
++                table.insert(lines, string.format("        local ok, err = %s.check_schema(conf.plugins, %s)", 
++                    check.module or "plugins", plugin_type))
++                table.insert(lines, "        if not ok then")
++                table.insert(lines, "            return nil, {error_msg = \"invalid plugins configuration: \" .. err}")
++                table.insert(lines, "        end")
++                table.insert(lines, "    end")
++            elseif check.type == "id_consistency" then
++                table.insert(lines, string.format("    if %s and %s ~= conf.%s then", check.id_var, check.id_var, check.conf_field))
++                table.insert(lines, string.format("        return nil, {error_msg = \"wrong %s\" }", check.conf_field))
++                table.insert(lines, "    end")
++            elseif check.type == "reference_check" then
++                table.insert(lines, string.format("    if conf.%s and not opts.skip_references_check then", check.field))
++                table.insert(lines, string.format("        local key = \"/%s/\" .. conf.%s", check.resource, check.field))
++                table.insert(lines, "        local res, err = core.etcd.get(key)")
++                table.insert(lines, "        if not res then")
++                table.insert(lines, string.format("            return nil, {error_msg = \"failed to fetch %s info by %s id [\" .. conf.%s .. \"]: \"",
++                    check.resource_desc or check.resource, check.resource_desc or check.resource, check.field))
++                table.insert(lines, "                                  .. err}")
++                table.insert(lines, "        end")
++                table.insert(lines, "        if res.status ~= 200 then")
++                table.insert(lines, string.format("            return nil, {error_msg = \"failed to fetch %s info by %s id [\" .. conf.%s .. \"], \"",
++                    check.resource_desc or check.resource, check.resource_desc or check.resource, check.field))
++                table.insert(lines, "                                  .. \"response code: \" .. res.status}")
++                table.insert(lines, "        end")
++                table.insert(lines, "    end")
++            elseif check.type == "sub_schema" then
++                table.insert(lines, string.format("    local %s_conf = conf.%s", check.field, check.field))
++                table.insert(lines, string.format("    if %s_conf then", check.field))
++                table.insert(lines, string.format("        local ok, err = %s.check_%s_conf(%s_conf)", 
++                    check.module, check.field, check.field))
++                table.insert(lines, "        if not ok then")
++                table.insert(lines, "            return nil, {error_msg = err}")
++                table.insert(lines, "        end")
++                table.insert(lines, "    end")
++            elseif check.type == "custom" then
++                for _, line in ipairs(check.code) do
++                    table.insert(lines, line)
++                end
++            end
++        end
++        
++        if def.return_id_field then
++            table.insert(lines, string.format("    return conf.%s", def.return_id_field))
++        else
++            table.insert(lines, "    return true")
++        end
++        table.insert(lines, "end")
++        table.insert(lines, "")
++    end
++    
++    if def.encrypt_conf then
++        table.insert(lines, "local function encrypt_conf(id, conf)")
++        for _, enc in ipairs(def.encrypt_conf) do
++            table.insert(lines, string.format("    %s", enc))
++        end
++        table.insert(lines, "end")
++        table.insert(lines, "")
++    end
++    
++    if def.delete_checker then
++        table.insert(lines, "local function delete_checker(id)")
++        for _, line in ipairs(def.delete_checker) do
++            table.insert(lines, line)
++        end
++        table.insert(lines, "    return nil, nil")
++        table.insert(lines, "end")
++        table.insert(lines, "")
++    end
++    
++    table.insert(lines, "return resource.new({")
++    table.insert(lines, string.format("    name = \"%s\",", def.name))
++    table.insert(lines, string.format("    kind = \"%s\",", def.kind))
++    table.insert(lines, string.format("    schema = %s,", def.schema))
++    
++    if def.check_conf then
++        table.insert(lines, "    checker = check_conf,")
++    end
++    if def.encrypt_conf then
++        table.insert(lines, "    encrypt_conf = encrypt_conf,")
++    end
++    if def.unsupported_methods then
++        table.insert(lines, string.format("    unsupported_methods = %s,", table_to_lua(def.unsupported_methods, 2)))
++    end
++    if def.list_filter_fields then
++        table.insert(lines, string.format("    list_filter_fields = %s,", table_to_lua(def.list_filter_fields, 2)))
++    end
++    if def.delete_checker then
++        table.insert(lines, "    delete_checker = delete_checker,")
++    end
++    
++    if def.custom_new_params then
++        for k, v in pairs(def.custom_new_params) do
++            if type(v) == "string" then
++                table.insert(lines, string.format("    %s = %s,", k, v))
++            else
++                table.insert(lines, string.format("    %s = %s,", k, table_to_lua(v, 2)))
++            end
++        end
++    end
++    
++    table.insert(lines, "})")
++    
++    return table.concat(lines, "\n")
++end
++
++return _M
