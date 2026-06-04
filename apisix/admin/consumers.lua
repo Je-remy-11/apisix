@@ -21,24 +21,29 @@ local resource = require("apisix.admin.resource")
 
 
 local function check_conf(username, conf, need_username, schema, opts)
-    opts = opts or {}
-    local ok, err = core.schema.check(schema, conf)
-    if not ok then
-        return nil, {error_msg = "invalid configuration: " .. err}
+    if not conf then
+        return nil, {error_msg = "missing configuration"}
     end
 
-    if username and username ~= conf.username then
-        return nil, {error_msg = "wrong username" }
-    end
-
-    if conf.plugins then
-        ok, err = plugins.check_schema(conf.plugins, core.schema.TYPE_CONSUMER)
-        if not ok then
-            return nil, {error_msg = "invalid plugins configuration: " .. err}
+    if need_username then
+        if not username then
+            return nil, {error_msg = "missing consumer username"}
         end
     end
 
-    if conf.group_id and not opts.skip_references_check then
+    if username and conf.username and username ~= conf.username then
+        return nil, {error_msg = "wrong consumer username"}
+    end
+
+    if not conf.username then
+        return nil, {error_msg = "missing consumer username"}
+    end
+
+    if need_username then
+        username = conf.username
+    end
+
+    if conf.group_id then
         local key = "/consumer_groups/" .. conf.group_id
         local res, err = core.etcd.get(key)
         if not res then
@@ -59,7 +64,25 @@ end
 
 
 local function encrypt_conf(id, conf)
-    plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
+    if conf.plugins then
+        plugins_encrypt_conf(conf.plugins)
+    end
+
+    if conf.group_id then
+        local key = "/consumer_groups/" .. conf.group_id
+        local res, err = core.etcd.get(key)
+        if not res then
+            return nil, {error_msg = "failed to fetch consumer group info by "
+                                     .. "consumer group id [" .. conf.group_id .. "]: "
+                                     .. err}
+        end
+
+        if res.status ~= 200 then
+            return nil, {error_msg = "failed to fetch consumer group info by "
+                                     .. "consumer group id [" .. conf.group_id .. "], "
+                                     .. "response code: " .. res.status}
+        end
+    end
 end
 
 
@@ -69,5 +92,4 @@ return resource.new({
     schema = core.schema.consumer,
     checker = check_conf,
     encrypt_conf = encrypt_conf,
-    unsupported_methods = {"post", "patch"}
 })

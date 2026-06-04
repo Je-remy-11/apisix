@@ -1,0 +1,276 @@
+diff --git a/1.1.1.patch b/1.1.1.patch
+new file mode 100644
+index 00000000..1a059e08
+--- /dev/null
++++ b/1.1.1.patch
+@@ -0,0 +1,186 @@
++diff --git a/1.4.2.patch b/1.4.2.patch
++new file mode 100644
++index 00000000..e69de29b
++diff --git a/apisix/admin/consumers.lua b/apisix/admin/consumers.lua
++index 32b1a944..eb829701 100644
++--- a/apisix/admin/consumers.lua
+++++ b/apisix/admin/consumers.lua
++@@ -20,15 +20,35 @@ local plugins_encrypt_conf = require("apisix.admin.plugins").encrypt_conf
++ local resource = require("apisix.admin.resource")
++ 
++ 
++-local function check_conf(username, conf, need_username, schema, opts)
+++local function check_group_id(group_id)
+++    local key = "/consumer_groups/" .. group_id
+++    local res, err = core.etcd.get(key)
+++    if not res then
+++        return nil, {error_msg = "failed to fetch consumer group info by "
+++                                 .. "consumer group id [" .. group_id .. "]: "
+++                                 .. err}
+++    end
+++
+++    if res.status ~= 200 then
+++        return nil, {error_msg = "failed to fetch consumer group info by "
+++                                 .. "consumer group id [" .. group_id .. "], "
+++                                 .. "response code: " .. res.status}
+++    end
+++
+++    return true
+++end
+++
+++
+++local function check_conf(username, conf, _need_username, schema, opts)
++     opts = opts or {}
+++
++     local ok, err = core.schema.check(schema, conf)
++     if not ok then
++         return nil, {error_msg = "invalid configuration: " .. err}
++     end
++ 
++     if username and username ~= conf.username then
++-        return nil, {error_msg = "wrong username" }
+++        return nil, {error_msg = "wrong username"}
++     end
++ 
++     if conf.plugins then
++@@ -39,18 +59,9 @@ local function check_conf(username, conf, need_username, schema, opts)
++     end
++ 
++     if conf.group_id and not opts.skip_references_check then
++-        local key = "/consumer_groups/" .. conf.group_id
++-        local res, err = core.etcd.get(key)
++-        if not res then
++-            return nil, {error_msg = "failed to fetch consumer group info by "
++-                                     .. "consumer group id [" .. conf.group_id .. "]: "
++-                                     .. err}
++-        end
++-
++-        if res.status ~= 200 then
++-            return nil, {error_msg = "failed to fetch consumer group info by "
++-                                     .. "consumer group id [" .. conf.group_id .. "], "
++-                                     .. "response code: " .. res.status}
+++        ok, err = check_group_id(conf.group_id)
+++        if not ok then
+++            return nil, err
++         end
++     end
++ 
++@@ -58,7 +69,7 @@ local function check_conf(username, conf, need_username, schema, opts)
++ end
++ 
++ 
++-local function encrypt_conf(id, conf)
+++local function encrypt_conf(_id, conf)
++     plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
++ end
++ 
++@@ -69,5 +80,5 @@ return resource.new({
++     schema = core.schema.consumer,
++     checker = check_conf,
++     encrypt_conf = encrypt_conf,
++-    unsupported_methods = {"post", "patch"}
+++    unsupported_methods = {"post"}
++ })
++diff --git a/t/admin/consumers.t b/t/admin/consumers.t
++index 2e9c5e20..8397f0b1 100644
++--- a/t/admin/consumers.t
+++++ b/t/admin/consumers.t
++@@ -360,3 +360,98 @@ GET /t
++ --- error_code: 400
++ --- response_body eval
++ qr/\{"error_msg":"the property is forbidden:.*"\}/
+++
+++
+++
+++=== TEST 12: patch consumer with partial body
+++--- config
+++    location /t {
+++        content_by_lua_block {
+++            local t = require("lib.test_admin").test
+++            local etcd = require("apisix.core.etcd")
+++
+++            local code, body = t('/apisix/admin/consumers',
+++                ngx.HTTP_PUT,
+++                [[{
+++                    "username": "patch-jack",
+++                    "desc": "before patch",
+++                    "plugins": {
+++                        "key-auth": {
+++                            "key": "auth-one"
+++                        }
+++                    }
+++                }]]
+++            )
+++            if code >= 300 then
+++                ngx.status = code
+++                ngx.say(body)
+++                return
+++            end
+++
+++            local res = assert(etcd.get('/consumers/patch-jack'))
+++            local prev_create_time = res.body.node.value.create_time
+++            local prev_update_time = res.body.node.value.update_time
+++            assert(prev_create_time ~= nil, "create_time is nil")
+++            assert(prev_update_time ~= nil, "update_time is nil")
+++            ngx.sleep(1)
+++
+++            local code, body = t('/apisix/admin/consumers/patch-jack',
+++                ngx.HTTP_PATCH,
+++                [[{
+++                    "labels": {
+++                        "env": "production"
+++                    }
+++                }]],
+++                [[{
+++                    "value": {
+++                        "username": "patch-jack",
+++                        "desc": "before patch",
+++                        "labels": {
+++                            "env": "production"
+++                        }
+++                    },
+++                    "key": "/apisix/consumers/patch-jack"
+++                }]]
+++            )
+++
+++            if code >= 300 then
+++                ngx.status = code
+++                ngx.say(body)
+++                return
+++            end
+++
+++            local code, body = t('/apisix/admin/consumers/patch-jack',
+++                ngx.HTTP_GET,
+++                nil,
+++                [[{
+++                    "value": {
+++                        "username": "patch-jack",
+++                        "desc": "before patch",
+++                        "labels": {
+++                            "env": "production"
+++                        },
+++                        "plugins": {
+++                            "key-auth": {
+++                                "key": "auth-one"
+++                            }
+++                        }
+++                    },
+++                    "key": "/apisix/consumers/patch-jack"
+++                }]]
+++            )
+++
+++            ngx.status = code
+++            ngx.say(body)
+++
+++            local res = assert(etcd.get('/consumers/patch-jack'))
+++            local create_time = res.body.node.value.create_time
+++            local update_time = res.body.node.value.update_time
+++            assert(prev_create_time == create_time, "create_time mismatched")
+++            assert(update_time ~= nil, "update_time is nil")
+++            assert(prev_update_time ~= update_time, "update_time should be changed")
+++        }
+++    }
+++--- request
+++GET /t
+++--- response_body
+++passed
+diff --git a/1.4.3.patch b/1.4.3.patch
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/apisix/admin/consumers.lua b/apisix/admin/consumers.lua
+index 32b1a944..47c9356a 100644
+--- a/apisix/admin/consumers.lua
++++ b/apisix/admin/consumers.lua
+@@ -21,24 +21,29 @@ local resource = require("apisix.admin.resource")
+ 
+ 
+ local function check_conf(username, conf, need_username, schema, opts)
+-    opts = opts or {}
+-    local ok, err = core.schema.check(schema, conf)
+-    if not ok then
+-        return nil, {error_msg = "invalid configuration: " .. err}
++    if not conf then
++        return nil, {error_msg = "missing configuration"}
+     end
+ 
+-    if username and username ~= conf.username then
+-        return nil, {error_msg = "wrong username" }
++    if need_username then
++        if not username then
++            return nil, {error_msg = "missing consumer username"}
++        end
+     end
+ 
+-    if conf.plugins then
+-        ok, err = plugins.check_schema(conf.plugins, core.schema.TYPE_CONSUMER)
+-        if not ok then
+-            return nil, {error_msg = "invalid plugins configuration: " .. err}
+-        end
++    if username and conf.username and username ~= conf.username then
++        return nil, {error_msg = "wrong consumer username"}
++    end
++
++    if not conf.username then
++        return nil, {error_msg = "missing consumer username"}
++    end
++
++    if need_username then
++        username = conf.username
+     end
+ 
+-    if conf.group_id and not opts.skip_references_check then
++    if conf.group_id then
+         local key = "/consumer_groups/" .. conf.group_id
+         local res, err = core.etcd.get(key)
+         if not res then
+@@ -59,7 +64,25 @@ end
+ 
+ 
+ local function encrypt_conf(id, conf)
+-    plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
++    if conf.plugins then
++        plugins_encrypt_conf(conf.plugins)
++    end
++
++    if conf.group_id then
++        local key = "/consumer_groups/" .. conf.group_id
++        local res, err = core.etcd.get(key)
++        if not res then
++            return nil, {error_msg = "failed to fetch consumer group info by "
++                                     .. "consumer group id [" .. conf.group_id .. "]: "
++                                     .. err}
++        end
++
++        if res.status ~= 200 then
++            return nil, {error_msg = "failed to fetch consumer group info by "
++                                     .. "consumer group id [" .. conf.group_id .. "], "
++                                     .. "response code: " .. res.status}
++        end
++    end
+ end
+ 
+ 
+@@ -69,5 +92,4 @@ return resource.new({
+     schema = core.schema.consumer,
+     checker = check_conf,
+     encrypt_conf = encrypt_conf,
+-    unsupported_methods = {"post", "patch"}
+-})
++})
+\ No newline at end of file
