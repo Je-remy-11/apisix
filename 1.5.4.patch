@@ -1,0 +1,481 @@
+diff --git a/t/admin/consumers-group-id.t b/t/admin/consumers-group-id.t
+new file mode 100644
+index 00000000..4dad9453
+--- /dev/null
++++ b/t/admin/consumers-group-id.t
+@@ -0,0 +1,369 @@
++#
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++use t::APISIX 'no_plan';
++
++repeat_each(1);
++no_long_string();
++no_root_location();
++no_shuffle();
++log_level("info");
++
++add_block_preprocessor(sub {
++    my ($block) = @_;
++
++    if (!$block->request) {
++        $block->set_value("request", "GET /t");
++    }
++
++    if ((!defined $block->error_log) && (!defined $block->no_error_log)) {
++        $block->set_value("no_error_log", "[error]\n[alert]");
++    }
++});
++
++run_tests;
++
++__DATA__
++
++=== TEST 1: integration - setup consumer group
++--- config
++    location /t {
++        content_by_lua_block {
++            local t = require("lib.test_admin").test
++            local code, body = t('/apisix/admin/consumer_groups/existing_group',
++                ngx.HTTP_PUT,
++                [[{
++                    "plugins": {
++                        "limit-count": {
++                            "count": 100,
++                            "time_window": 60,
++                            "rejected_code": 503,
++                            "key": "remote_addr"
++                        }
++                    }
++                }]]
++            )
++            ngx.status = code
++            ngx.say(body)
++        }
++    }
++--- error_code: 201
++--- response_body
++passed
++
++
++
++=== TEST 2: integration - create consumer with valid group_id (etcd success)
++--- config
++    location /t {
++        content_by_lua_block {
++            local t = require("lib.test_admin").test
++            local code, body = t('/apisix/admin/consumers/user1',
++                ngx.HTTP_PUT,
++                [[{
++                    "username": "user1",
++                    "plugins": {
++                        "key-auth": {
++                            "key": "auth-key-1"
++                        }
++                    },
++                    "group_id": "existing_group"
++                }]]
++            )
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++            ngx.say(body)
++        }
++    }
++--- response_body
++passed
++
++
++
++=== TEST 3: integration - create consumer with non-existent group_id (etcd returns 404)
++--- config
++    location /t {
++        content_by_lua_block {
++            local t = require("lib.test_admin").test
++            local code, body = t('/apisix/admin/consumers/user2',
++                ngx.HTTP_PUT,
++                [[{
++                    "username": "user2",
++                    "plugins": {
++                        "key-auth": {
++                            "key": "auth-key-2"
++                        }
++                    },
++                    "group_id": "non_existent_group"
++                }]]
++            )
++            ngx.status = code
++            ngx.say(body)
++        }
++    }
++--- error_code: 400
++--- response_body eval
++qr{failed to fetch consumer group info by consumer group id \[non_existent_group\]}
++
++
++
++=== TEST 4: integration - create consumer without group_id (no etcd call)
++--- config
++    location /t {
++        content_by_lua_block {
++            local t = require("lib.test_admin").test
++            local code, body = t('/apisix/admin/consumers/user3',
++                ngx.HTTP_PUT,
++                [[{
++                    "username": "user3",
++                    "plugins": {
++                        "key-auth": {
++                            "key": "auth-key-3"
++                        }
++                    }
++                }]]
++            )
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++            ngx.say(body)
++        }
++    }
++--- response_body
++passed
++
++
++
++=== TEST 5: integration - cleanup consumer group and consumers
++--- config
++    location /t {
++        content_by_lua_block {
++            local t = require("lib.test_admin").test
++            local code, body
++
++            code, body = t('/apisix/admin/consumers/user1',
++                ngx.HTTP_DELETE)
++            if code >= 300 then
++                ngx.log(ngx.WARN, "failed to delete consumer user1: ", body)
++            end
++
++            code, body = t('/apisix/admin/consumers/user2',
++                ngx.HTTP_DELETE)
++            if code >= 300 then
++                ngx.log(ngx.WARN, "failed to delete consumer user2: ", body)
++            end
++
++            code, body = t('/apisix/admin/consumers/user3',
++                ngx.HTTP_DELETE)
++            if code >= 300 then
++                ngx.log(ngx.WARN, "failed to delete consumer user3: ", body)
++            end
++
++            code, body = t('/apisix/admin/consumer_groups/existing_group',
++                ngx.HTTP_DELETE)
++            ngx.status = code
++            ngx.say(body)
++        }
++    }
++--- response_body
++passed
++
++
++
++=== TEST 6: unit - mock etcd.get returns 200 (group exists)
++When core.etcd.get returns {status=200}, check_conf should pass.
++--- config
++    location /t {
++        content_by_lua_block {
++            local core = require("apisix.core")
++            local backup = core.etcd.get
++            core.etcd.get = function(key)
++                ngx.log(ngx.INFO, "mock etcd.get called with key: ", key)
++                return {status = 200}, nil
++            end
++
++            local t = require("lib.test_admin").test
++            local code, body = t('/apisix/admin/consumers/mock_user_200',
++                ngx.HTTP_PUT,
++                [[{
++                    "username": "mock_user_200",
++                    "plugins": {
++                        "key-auth": {
++                            "key": "mock-key-200"
++                        }
++                    },
++                    "group_id": "mock_group_200"
++                }]]
++            )
++
++            core.etcd.get = backup
++
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++            ngx.say(body)
++
++
++            local code2, body2 = t('/apisix/admin/consumers/mock_user_200',
++                ngx.HTTP_DELETE)
++            if code2 >= 300 then
++                ngx.log(ngx.WARN, "cleanup failed: ", body2)
++            end
++        }
++    }
++--- response_body
++passed
++
++
++
++=== TEST 7: unit - mock etcd.get returns 404 (group not found)
++When core.etcd.get returns {status=404}, check_conf should reject.
++--- config
++    location /t {
++        content_by_lua_block {
++            local core = require("apisix.core")
++            local backup = core.etcd.get
++            core.etcd.get = function(key)
++                ngx.log(ngx.INFO, "mock etcd.get called with key: ", key)
++                return {status = 404}, nil
++            end
++
++            local t = require("lib.test_admin").test
++            local code, body = t('/apisix/admin/consumers/mock_user_404',
++                ngx.HTTP_PUT,
++                [[{
++                    "username": "mock_user_404",
++                    "plugins": {
++                        "key-auth": {
++                            "key": "mock-key-404"
++                        }
++                    },
++                    "group_id": "mock_group_404"
++                }]]
++            )
++
++            core.etcd.get = backup
++
++            ngx.status = code
++            ngx.say(body)
++        }
++    }
++--- error_code: 400
++--- response_body eval
++qr{failed to fetch consumer group info by consumer group id \[mock_group_404\], response code: 404}
++
++
++
++=== TEST 8: unit - mock etcd.get returns nil (etcd connection failure)
++When core.etcd.get returns nil with error, check_conf should reject with failure message.
++--- config
++    location /t {
++        content_by_lua_block {
++            local core = require("apisix.core")
++            local backup = core.etcd.get
++            core.etcd.get = function(key)
++                ngx.log(ngx.INFO, "mock etcd.get called with key: ", key)
++                return nil, "connection refused"
++            end
++
++            local t = require("lib.test_admin").test
++            local code, body = t('/apisix/admin/consumers/mock_user_fail',
++                ngx.HTTP_PUT,
++                [[{
++                    "username": "mock_user_fail",
++                    "plugins": {
++                        "key-auth": {
++                            "key": "mock-key-fail"
++                        }
++                    },
++                    "group_id": "mock_group_fail"
++                }]]
++            )
++
++            core.etcd.get = backup
++
++            ngx.status = code
++            ngx.say(body)
++        }
++    }
++--- error_code: 400
++--- response_body eval
++qr{failed to fetch consumer group info by consumer group id \[mock_group_fail\]: connection refused}
++
++
++
++=== TEST 9: unit - mock etcd.get arbitrary key assertion
++Verify that mock receives the expected etcd key path "/consumer_groups/<group_id>".
++--- config
++    location /t {
++        content_by_lua_block {
++            local core = require("apisix.core")
++            local backup = core.etcd.get
++            local captured_key
++
++            core.etcd.get = function(key)
++                captured_key = key
++                ngx.log(ngx.INFO, "mock etcd.get captured key: ", key)
++                return {status = 200}, nil
++            end
++
++            local t = require("lib.test_admin").test
++            local code, body = t('/apisix/admin/consumers/mock_user_keycheck',
++                ngx.HTTP_PUT,
++                [[{
++                    "username": "mock_user_keycheck",
++                    "plugins": {
++                        "key-auth": {
++                            "key": "mock-key-check"
++                        }
++                    },
++                    "group_id": "assert_this_key"
++                }]]
++            )
++
++            core.etcd.get = backup
++
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++
++            if captured_key ~= "/consumer_groups/assert_this_key" then
++                ngx.status = 500
++                ngx.say("unexpected etcd key: " .. tostring(captured_key))
++                return
++            end
++
++            ngx.say(body)
++
++
++            local code2, body2 = t('/apisix/admin/consumers/mock_user_keycheck',
++                ngx.HTTP_DELETE)
++            if code2 >= 300 then
++                ngx.log(ngx.WARN, "cleanup failed: ", body2)
++            end
++        }
++    }
++--- response_body
++passed
+\ No newline at end of file
+diff --git a/t/lib/mock_etcd.lua b/t/lib/mock_etcd.lua
+new file mode 100644
+index 00000000..eec54378
+--- /dev/null
++++ b/t/lib/mock_etcd.lua
+@@ -0,0 +1,98 @@
++--
++-- Licensed to the Apache Software Foundation (ASF) under one or more
++-- contributor license agreements.  See the NOTICE file distributed with
++-- this work for additional information regarding copyright ownership.
++-- The ASF licenses this file to You under the Apache License, Version 2.0
++-- (the "License"); you may not use this file except in compliance with
++-- the License.  You may obtain a copy of the License at
++--
++--     http://www.apache.org/licenses/LICENSE-2.0
++--
++-- Unless required by applicable law or agreed to in writing, software
++-- distributed under the License is distributed on an "AS IS" BASIS,
++-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++-- See the License for the specific language governing permissions and
++-- limitations under the License.
++--
++local core = require("apisix.core")
++
++
++local _M = {}
++
++
++local originals = {}
++
++
++function _M.mock_get(mock_fn)
++    if not originals.get then
++        originals.get = core.etcd.get
++    end
++    core.etcd.get = mock_fn
++end
++
++
++function _M.mock_get_success(key)
++    _M.mock_get(function(ekey)
++        ngx.log(ngx.INFO, "mock etcd.get success for key: ", ekey)
++        return {status = 200}, nil
++    end)
++end
++
++
++function _M.mock_get_not_found(key)
++    _M.mock_get(function(ekey)
++        ngx.log(ngx.INFO, "mock etcd.get not_found for key: ", ekey)
++        return {status = 404}, nil
++    end)
++end
++
++
++function _M.mock_get_error(key, err_msg)
++    err_msg = err_msg or "connection refused"
++    _M.mock_get(function(ekey)
++        ngx.log(ngx.INFO, "mock etcd.get error for key: ", ekey)
++        return nil, err_msg
++    end)
++end
++
++
++function _M.mock_get_with_recorder()
++    local calls = {}
++    _M.mock_get(function(ekey)
++        ngx.log(ngx.INFO, "mock etcd.get recorder for key: ", ekey)
++        table.insert(calls, ekey)
++        return {status = 200}, nil
++    end)
++    return calls
++end
++
++
++function _M.restore()
++    if originals.get then
++        core.etcd.get = originals.get
++        originals.get = nil
++    end
++end
++
++
++function _M.mock_set(mock_fn)
++    if not originals.set then
++        originals.set = core.etcd.set
++    end
++    core.etcd.set = mock_fn
++end
++
++
++function _M.restore_all()
++    if originals.get then
++        core.etcd.get = originals.get
++        originals.get = nil
++    end
++    if originals.set then
++        core.etcd.set = originals.set
++        originals.set = nil
++    end
++end
++
++
++return _M
+\ No newline at end of file
