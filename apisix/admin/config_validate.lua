@@ -25,9 +25,11 @@ local pairs        = pairs
 local ipairs       = ipairs
 local tostring     = tostring
 local pcall        = pcall
+local xpcall       = xpcall
 local str_find     = string.find
 local str_sub      = string.sub
 local table_insert = table.insert
+local debug        = require("debug")
 local yaml         = require("lyaml")
 local core         = require("apisix.core")
 local tbl_deepcopy = require("apisix.core.table").deepcopy
@@ -68,7 +70,7 @@ for dir in pairs(constants.STREAM_ETCD_DIRECTORY) do
 end
 
 
-local function check_duplicate(item, key, id_set)
+local function check_duplicate(item, key, id_set, index)
     local identifier, identifier_type
     if key == "consumers" then
         identifier = item.id or item.username
@@ -79,6 +81,13 @@ local function check_duplicate(item, key, id_set)
     end
 
     if not identifier then
+        -- 对于缺少唯一标识的条目，我们仍然检查是否有其他同样缺少标识的条目
+        -- 使用索引作为临时标识来标记这种情况
+        local missing_key = "missing_" .. identifier_type
+        if id_set[missing_key] then
+            return true, "found multiple entries without " .. identifier_type .. " in " .. key
+        end
+        id_set[missing_key] = true
         return false
     end
 
@@ -148,15 +157,70 @@ function _M.validate_configuration(req_body, collect_all_errors)
             local id_set = {}
 
             for index, item in ipairs(items) do
-                local item_temp = tbl_deepcopy(item)
-                local ok, valid, err = pcall(check_conf, item_checker, item_schema, item_temp, key)
-                if not ok then
-                    -- checker threw an error
-                    err = valid  -- pcall returns (false, error_message)
-                    valid = false
+                local item_temp
+                local copy_start = ngx and ngx.now() or os.time()
+                
+                -- 深拷贝并监控性能
+                local ok_copy, err_copy = pcall(function()
+                    item_temp = tbl_deepcopy(item)
+                end)
+                
+                local copy_elapsed = ngx and (ngx.now() - copy_start) or (os.time() - copy_start)
+                
+                if not ok_copy then
+                    -- 深拷贝失败
+                    if not collect_all_errors then
+                        return false, "Failed to deep copy configuration item: " .. tostring(err_copy)
+                    end
+                    is_valid = false
+                    table_insert(validation_results, {
+                        resource_type = key,
+                        index = index - 1,
+                        error = "Failed to deep copy configuration item: " .. tostring(err_copy)
+                    })
+                    goto continue
                 end
+                
+                -- 记录深拷贝耗时警告（超过 1ms）
+                if copy_elapsed > 0.001 then
+                    core.log.warn("Deep copy of ", key, " item at index ", index - 1, 
+                                  " took ", copy_elapsed, "s")
+                end
+
+                -- 使用 xpcall 捕获错误并保留堆栈
+                local valid, err
+                local function err_handler(err_obj)
+                    return {
+                        error_msg = tostring(err_obj),
+                        traceback = debug.traceback()
+                    }
+                end
+                
+                local ok, result = xpcall(function()
+                    return check_conf(item_checker, item_schema, item_temp, key)
+                end, err_handler)
+                
+                if not ok then
+                    -- checker 抛出了错误，result 是错误对象
+                    valid = false
+                    err = result
+                else
+                    valid, err = result
+                end
+                
                 if not valid then
-                    local err_msg = type(err) == "table" and err.error_msg or tostring(err)
+                    local err_msg
+                    if type(err) == "table" then
+                        if err.traceback then
+                            -- 包含堆栈跟踪的详细错误
+                            err_msg = err.error_msg .. "\n" .. err.traceback
+                        else
+                            err_msg = err.error_msg or tostring(err)
+                        end
+                    else
+                        err_msg = tostring(err)
+                    end
+                    
                     local resource_id = item.id or item.username or ""
 
                     if not collect_all_errors then
@@ -172,7 +236,7 @@ function _M.validate_configuration(req_body, collect_all_errors)
                 end
 
                 -- check for duplicate IDs
-                local duplicated, dup_err = check_duplicate(item, key, id_set)
+                local duplicated, dup_err = check_duplicate(item, key, id_set, index)
                 if duplicated then
                     if not collect_all_errors then
                         return false, dup_err
@@ -185,6 +249,8 @@ function _M.validate_configuration(req_body, collect_all_errors)
                         error = dup_err
                     })
                 end
+                
+                ::continue::
             end
         end
     end
