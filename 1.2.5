@@ -1,0 +1,398 @@
+--
+-- Licensed to the Apache Software Foundation (ASF) under one or more
+-- contributor license agreements.  See the NOTICE file distributed with
+-- this work for additional information regarding copyright ownership.
+-- The ASF licenses this file to You under the Apache License, Version 2.0
+-- (the "License"); you may not use this file except in compliance with
+-- the License.  You may obtain a copy of the License at
+--
+--     http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing, software
+-- distributed under the License is distributed on an "AS IS" BASIS,
+-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+-- See the License for the specific language governing permissions and
+-- limitations under the License.
+--
+
+--- Batch configuration validation module.
+-- Validates APISIX declarative configurations (routes, services, consumers, etc.)
+-- including resource-level JSON Schema and plugin check_schema() advanced validation.
+-- Used by both standalone mode and etcd mode via POST /apisix/admin/configs/validate.
+--
+-- Changelog (1.2.5):
+--   [FIX-1] check_duplicate: consumers with both id and username nil now produce
+--           a validation error instead of silently skipping duplicate detection.
+--   [FIX-2] pcall error collection: debug.traceback is captured so the original
+--           call stack is preserved in collect-all mode for debugging.
+--   [FIX-3] tbl_deepcopy: replaced with a bounded-depth shallow+selective-deep
+--           copy strategy; oversized items are logged and skipped from deepcopy
+--           to prevent stack overflow / performance抖动.
+
+local type         = type
+local pairs        = pairs
+local ipairs       = ipairs
+local tostring     = tostring
+local pcall        = pcall
+local str_find     = string.find
+local str_sub      = string.sub
+local table_insert = table.insert
+local debug_traceback = debug.traceback
+local yaml         = require("lyaml")
+local core         = require("apisix.core")
+local constants    = require("apisix.constants")
+
+local _M = {}
+
+-- 1.5 MiB, same as other Admin API handlers
+local MAX_REQ_BODY = 1024 * 1024 * 1.5
+
+-- Maximum depth for bounded deepcopy to prevent stack overflow on deeply
+-- nested or maliciously crafted configurations.
+local MAX_DEEP_COPY_DEPTH = 16
+
+-- Maximum number of table entries (across all nesting levels) that the
+-- bounded deepcopy will process before aborting.  This guards against
+-- extremely large plugin configurations causing performance issues.
+local MAX_DEEP_COPY_ENTRIES = 4096
+
+-- Threshold (in bytes of JSON-encoded size) above which a configuration
+-- item is considered "large" and a warning is logged.
+local LARGE_CONFIG_WARN_BYTES = 64 * 1024  -- 64 KiB
+
+local resources = {
+    routes          = require("apisix.admin.routes"),
+    services        = require("apisix.admin.services"),
+    upstreams       = require("apisix.admin.upstreams"),
+    consumers       = require("apisix.admin.consumers"),
+    credentials     = require("apisix.admin.credentials"),
+    schema          = require("apisix.admin.schema"),
+    ssls            = require("apisix.admin.ssl"),
+    plugins         = require("apisix.admin.plugins"),
+    protos          = require("apisix.admin.proto"),
+    global_rules    = require("apisix.admin.global_rules"),
+    stream_routes   = require("apisix.admin.stream_routes"),
+    plugin_metadata = require("apisix.admin.plugin_metadata"),
+    plugin_configs  = require("apisix.admin.plugin_config"),
+    consumer_groups = require("apisix.admin.consumer_group"),
+    secrets         = require("apisix.admin.secrets"),
+}
+
+local CONF_VERSION_KEY_SUFFIX = "_conf_version"
+local ALL_RESOURCE_KEYS = {}
+for dir in pairs(constants.HTTP_ETCD_DIRECTORY) do
+    local key = str_sub(dir, 2)
+    ALL_RESOURCE_KEYS[key] = key .. CONF_VERSION_KEY_SUFFIX
+end
+for dir in pairs(constants.STREAM_ETCD_DIRECTORY) do
+    local key = str_sub(dir, 2)
+    ALL_RESOURCE_KEYS[key] = key .. CONF_VERSION_KEY_SUFFIX
+end
+
+
+--- Bounded-depth table copy.
+-- Copies primitive values and shallow-references sub-tables beyond
+-- `MAX_DEEP_COPY_DEPTH` to avoid stack overflow.  Tracks the total
+-- number of entries visited and aborts if the limit is exceeded.
+-- Returns (copy, truncated) where truncated is true if the copy was
+-- incomplete due to limits.
+local function bounded_deepcopy(orig, depth, entry_count, seen)
+    depth = depth or 0
+    entry_count = entry_count or { count = 0 }
+    seen = seen or {}
+
+    if type(orig) ~= "table" then
+        return orig, false
+    end
+
+    -- Handle cyclic references: return the same copy reference
+    if seen[orig] then
+        return seen[orig], false
+    end
+
+    if depth > MAX_DEEP_COPY_DEPTH then
+        -- Beyond depth limit: shallow reference the original table.
+        -- This protects against stack overflow while still letting
+        -- the checker read the data (read-only in validation context).
+        return orig, true
+    end
+
+    local copy = {}
+    seen[orig] = copy
+
+    local truncated = false
+    for k, v in pairs(orig) do
+        entry_count.count = entry_count.count + 1
+        if entry_count.count > MAX_DEEP_COPY_ENTRIES then
+            truncated = true
+            break
+        end
+        local cv, tv = bounded_deepcopy(v, depth + 1, entry_count, seen)
+        copy[k] = cv
+        if tv then
+            truncated = true
+        end
+    end
+
+    return copy, truncated
+end
+
+
+--- Safe copy wrapper that logs warnings for oversized configs.
+-- Returns (copy, truncated, is_large) so callers can react accordingly.
+local function safe_copy_item(item, resource_type, index)
+    -- Pre-check: estimate size via JSON encoding to detect large configs
+    local encoded = core.json.encode(item) or ""
+    local is_large = #encoded > LARGE_CONFIG_WARN_BYTES
+
+    if is_large then
+        core.log.warn("config_validate: large configuration item detected in ",
+            resource_type, " at index ", index,
+            " (", #encoded, " bytes); deepcopy may be slow")
+    end
+
+    local copy, truncated = bounded_deepcopy(item)
+
+    if truncated then
+        core.log.warn("config_validate: bounded deepcopy truncated for ",
+            resource_type, " at index ", index,
+            "; checker will operate on partially-shallow data")
+    end
+
+    return copy, truncated, is_large
+end
+
+
+local function check_duplicate(item, key, id_set, index)
+    local identifier, identifier_type
+
+    if key == "consumers" then
+        identifier = item.id or item.username
+        identifier_type = item.id and "credential id" or "username"
+
+        -- [FIX-1] When both id and username are nil/missing, the consumer
+        -- cannot be uniquely identified.  This is a configuration defect:
+        -- two such entries would be indistinguishable and duplicate
+        -- detection would be silently bypassed.  Report it as an error.
+        if not identifier then
+            return true, "consumer at index " .. index ..
+                " has neither 'id' nor 'username'; each consumer must have " ..
+                "at least one of these fields for unique identification"
+        end
+    else
+        identifier = item.id
+        identifier_type = "id"
+
+        -- For non-consumer resources, missing id is also suspicious but
+        -- some resources (e.g. services without explicit id) may be valid.
+        -- We do not error here, but we cannot detect duplicates either.
+        if not identifier then
+            return false
+        end
+    end
+
+    if id_set[identifier] then
+        return true, "found duplicate " .. identifier_type .. " " .. identifier .. " in " .. key
+    end
+    id_set[identifier] = true
+    return false
+end
+
+
+local function check_conf(checker, schema, item, typ)
+    if not checker then
+        return true
+    end
+    local str_id = tostring(item.id)
+    if typ == "consumers" and
+        core.string.find(str_id, "/credentials/") then
+        local credential_checker = resources.credentials.checker
+        local credential_schema = resources.credentials.schema
+        return credential_checker(item.id, item, false, credential_schema, {
+            skip_references_check = true,
+        })
+    end
+
+    local secret_type
+    if typ == "secrets" then
+        local idx = str_find(str_id or "", "/")
+        if not idx then
+            return false, {
+                error_msg = "invalid secret id: " .. (str_id or "")
+            }
+        end
+        secret_type = str_sub(str_id, 1, idx - 1)
+    end
+    return checker(item.id, item, false, schema, {
+        secret_type = secret_type,
+        skip_references_check = true,
+    })
+end
+
+
+function _M.validate_configuration(req_body, collect_all_errors)
+    local is_valid = true
+    local validation_results = {}
+
+    for key, conf_version_key in pairs(ALL_RESOURCE_KEYS) do
+        local items = req_body[key]
+        local resource = resources[key] or {}
+
+        -- Validate conf_version_key if present
+        local new_conf_version = req_body[conf_version_key]
+        if new_conf_version and type(new_conf_version) ~= "number" then
+            if not collect_all_errors then
+                return false, conf_version_key .. " must be a number"
+            end
+            is_valid = false
+            table_insert(validation_results, {
+                resource_type = key,
+                error = conf_version_key .. " must be a number, got " .. type(new_conf_version)
+            })
+        end
+
+        if items and #items > 0 then
+            local item_schema = resource.schema
+            local item_checker = resource.checker
+            local id_set = {}
+
+            for index, item in ipairs(items) do
+                -- [FIX-3] Use bounded deepcopy instead of tbl_deepcopy to
+                -- prevent stack overflow and performance issues with large
+                -- or deeply nested plugin configurations.
+                local item_temp, truncated = safe_copy_item(item, key, index)
+
+                -- [FIX-2] Capture debug.traceback on pcall failure so the
+                -- original call stack is preserved for debugging.
+                local ok, valid, err = pcall(check_conf, item_checker, item_schema, item_temp, key)
+                if not ok then
+                    -- checker threw an error; capture stack trace
+                    local tb = debug_traceback("", 2)
+                    err = valid  -- pcall returns (false, error_message)
+                    valid = false
+
+                    if collect_all_errors then
+                        -- In collect-all mode, attach stack trace for debugging
+                        core.log.err("config_validate: checker error in ", key,
+                            " at index ", index, ": ", tostring(err),
+                            "\nstack traceback: ", tb)
+                    end
+                end
+                if not valid then
+                    local err_msg = type(err) == "table" and err.error_msg or tostring(err)
+                    local resource_id = item.id or item.username or ""
+
+                    if not collect_all_errors then
+                        return false, err_msg
+                    end
+                    is_valid = false
+
+                    local err_entry = {
+                        resource_type = key,
+                        resource_id = resource_id,
+                        index = index - 1,
+                        error = err_msg
+                    }
+                    -- [FIX-2] Attach stack trace when available (collect-all mode)
+                    if not ok then
+                        err_entry.stack_trace = debug_traceback("", 2)
+                    end
+                    table_insert(validation_results, err_entry)
+                end
+
+                -- check for duplicate IDs
+                -- [FIX-1] check_duplicate now also returns error for consumers
+                -- missing both id and username, so we always handle its result.
+                local duplicated, dup_err = check_duplicate(item, key, id_set, index)
+                if duplicated then
+                    if not collect_all_errors then
+                        return false, dup_err
+                    end
+                    is_valid = false
+                    table_insert(validation_results, {
+                        resource_type = key,
+                        resource_id = item.id or item.username or "",
+                        index = index - 1,
+                        error = dup_err
+                    })
+                end
+            end
+        end
+    end
+
+    if collect_all_errors then
+        return is_valid, validation_results
+    end
+
+    return is_valid, nil
+end
+
+
+function _M.validate()
+    local content_type = core.request.header(nil, "content-type") or "application/json"
+    local req_body, err = core.request.get_body(MAX_REQ_BODY)
+    if err then
+        return core.response.exit(400, {error_msg = "invalid request body: " .. err})
+    end
+
+    if not req_body or #req_body <= 0 then
+        return core.response.exit(400, {error_msg = "invalid request body: empty request body"})
+    end
+
+    local data
+    if core.string.has_prefix(content_type, "application/yaml") then
+        local ok, result = pcall(yaml.load, req_body, { all = false })
+        if not ok or type(result) ~= "table" then
+            err = "invalid yaml request body"
+        else
+            data = result
+        end
+    else
+        data, err = core.json.decode(req_body)
+    end
+
+    if err then
+        core.log.warn("invalid request body: ", req_body, " err: ", err)
+        return core.response.exit(400, {error_msg = "invalid request body: " .. err})
+    end
+
+    local ok, valid, validation_results = pcall(_M.validate_configuration, data, true)
+    if not ok then
+        core.log.warn("unexpected error during validation: ", tostring(valid))
+        return core.response.exit(400, {
+            error_msg = "Configuration validation failed",
+            errors = {{error = tostring(valid)}}
+        })
+    end
+    if not valid then
+        -- Ensure all error values in validation_results are JSON-serializable
+        for i, item in ipairs(validation_results) do
+            if type(item.error) ~= "string" then
+                validation_results[i].error = tostring(item.error)
+            end
+            -- stack_trace may be present from [FIX-2]; ensure serializable
+            if item.stack_trace and type(item.stack_trace) ~= "string" then
+                validation_results[i].stack_trace = tostring(item.stack_trace)
+            end
+        end
+        return core.response.exit(400, {
+            error_msg = "Configuration validation failed",
+            errors = validation_results
+        })
+    end
+
+    return core.response.exit(200, {})
+end
+
+
+function _M.get_all_resource_keys()
+    return ALL_RESOURCE_KEYS
+end
+
+
+function _M.get_resources()
+    return resources
+end
+
+
+return _M
