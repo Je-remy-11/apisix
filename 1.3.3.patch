@@ -1,0 +1,261 @@
+diff --git a/apisix/admin/config_validate.lua b/apisix/admin/config_validate.lua
+index b4d4b090..00d2ead0 100644
+--- a/apisix/admin/config_validate.lua
++++ b/apisix/admin/config_validate.lua
+@@ -68,132 +68,163 @@ for dir in pairs(constants.STREAM_ETCD_DIRECTORY) do
+ end
+ 
+ 
+-local function check_duplicate(item, key, id_set)
+-    local identifier, identifier_type
+-    if key == "consumers" then
+-        identifier = item.id or item.username
+-        identifier_type = item.id and "credential id" or "username"
+-    else
+-        identifier = item.id
+-        identifier_type = "id"
+-    end
++-- ============================================================================
++-- Decoupled Components
++-- ============================================================================
++
++-- 1. Error Collector: Handles fail-fast vs collect-all modes
++local ErrorCollector = {}
++function ErrorCollector:new(collect_all)
++    return setmetatable({
++        collect_all = collect_all,
++        errors = {},
++        is_valid = true
++    }, { __index = self })
++end
+ 
+-    if not identifier then
+-        return false
+-    end
++function ErrorCollector:report(err_obj)
++    self.is_valid = false
++    table_insert(self.errors, err_obj)
++    return self.collect_all -- returns true if we should continue checking
++end
+ 
+-    if id_set[identifier] then
+-        return true, "found duplicate " .. identifier_type .. " " .. identifier .. " in " .. key
++function ErrorCollector:get_result()
++    if self.collect_all then
++        return self.is_valid, self.errors
+     end
+-    id_set[identifier] = true
+-    return false
++    if not self.is_valid then
++        return false, self.errors[1].error
++    end
++    return true, nil
+ end
+ 
++-- 2. Strategy Pattern for Resource Validation
++local default_strategy = {
++    get_identifier = function(item)
++        return item.id, "id"
++    end,
++    check_item = function(item, schema, checker)
++        if not checker then return true end
++        return checker(item.id, item, false, schema, {
++            skip_references_check = true,
++        })
++    end
++}
+ 
+-local function check_conf(checker, schema, item, typ)
+-    if not checker then
+-        return true
++local resource_strategies = setmetatable({
++    consumers = {
++        get_identifier = function(item)
++            return item.id or item.username, item.id and "credential id" or "username"
++        end,
++        check_item = function(item, schema, checker)
++            if not checker then return true end
++            local str_id = tostring(item.id)
++            if core.string.find(str_id, "/credentials/") then
++                local cred_checker = resources.credentials.checker
++                local cred_schema = resources.credentials.schema
++                return cred_checker(item.id, item, false, cred_schema, {
++                    skip_references_check = true,
++                })
++            end
++            return checker(item.id, item, false, schema, {
++                skip_references_check = true,
++            })
++        end
++    },
++    secrets = {
++        get_identifier = default_strategy.get_identifier,
++        check_item = function(item, schema, checker)
++            if not checker then return true end
++            local str_id = tostring(item.id)
++            local idx = str_find(str_id or "", "/")
++            if not idx then
++                return false, { error_msg = "invalid secret id: " .. (str_id or "") }
++            end
++            local secret_type = str_sub(str_id, 1, idx - 1)
++            return checker(item.id, item, false, schema, {
++                secret_type = secret_type,
++                skip_references_check = true,
++            })
++        end
++    }
++}, {
++    __index = function() return default_strategy end
++})
++
++-- 3. Single Record Validator & Duplicate Detector
++local function validate_item(item, typ, resource, index, id_set, error_collector)
++    local strategy = resource_strategies[typ]
++    local item_temp = tbl_deepcopy(item)
++    
++    -- Check config
++    local ok, valid, err = pcall(strategy.check_item, item_temp, resource.schema, resource.checker)
++    if not ok then
++        err = valid
++        valid = false
+     end
+-    local str_id = tostring(item.id)
+-    if typ == "consumers" and
+-        core.string.find(str_id, "/credentials/") then
+-        local credential_checker = resources.credentials.checker
+-        local credential_schema = resources.credentials.schema
+-        return credential_checker(item.id, item, false, credential_schema, {
+-            skip_references_check = true,
++
++    local identifier = strategy.get_identifier(item) or ""
++    
++    if not valid then
++        local err_msg = type(err) == "table" and err.error_msg or tostring(err)
++        local should_continue = error_collector:report({
++            resource_type = typ,
++            resource_id = identifier,
++            index = index - 1,
++            error = err_msg
+         })
++        if not should_continue then return false end
+     end
+ 
+-    local secret_type
+-    if typ == "secrets" then
+-        local idx = str_find(str_id or "", "/")
+-        if not idx then
+-            return false, {
+-                error_msg = "invalid secret id: " .. (str_id or "")
+-            }
++    -- Check duplicate
++    local ident, ident_type = strategy.get_identifier(item)
++    if ident then
++        if id_set[ident] then
++            local dup_err = "found duplicate " .. ident_type .. " " .. ident .. " in " .. typ
++            local should_continue = error_collector:report({
++                resource_type = typ,
++                resource_id = identifier,
++                index = index - 1,
++                error = dup_err
++            })
++            if not should_continue then return false end
++        else
++            id_set[ident] = true
+         end
+-        secret_type = str_sub(str_id, 1, idx - 1)
+     end
+-    return checker(item.id, item, false, schema, {
+-        secret_type = secret_type,
+-        skip_references_check = true,
+-    })
+-end
+ 
++    return true
++end
+ 
+ function _M.validate_configuration(req_body, collect_all_errors)
+-    local is_valid = true
+-    local validation_results = {}
++    local error_collector = ErrorCollector:new(collect_all_errors)
+ 
+     for key, conf_version_key in pairs(ALL_RESOURCE_KEYS) do
+-        local items = req_body[key]
+-        local resource = resources[key] or {}
+-
+-        -- Validate conf_version_key if present
+         local new_conf_version = req_body[conf_version_key]
+         if new_conf_version and type(new_conf_version) ~= "number" then
+-            if not collect_all_errors then
+-                return false, conf_version_key .. " must be a number"
+-            end
+-            is_valid = false
+-            table_insert(validation_results, {
++            local should_continue = error_collector:report({
+                 resource_type = key,
+                 error = conf_version_key .. " must be a number, got " .. type(new_conf_version)
+             })
++            if not should_continue then
++                return error_collector:get_result()
++            end
+         end
+ 
++        local items = req_body[key]
+         if items and #items > 0 then
+-            local item_schema = resource.schema
+-            local item_checker = resource.checker
++            local resource = resources[key] or {}
+             local id_set = {}
+-
+             for index, item in ipairs(items) do
+-                local item_temp = tbl_deepcopy(item)
+-                local ok, valid, err = pcall(check_conf, item_checker, item_schema, item_temp, key)
++                local ok = validate_item(item, key, resource, index, id_set, error_collector)
+                 if not ok then
+-                    -- checker threw an error
+-                    err = valid  -- pcall returns (false, error_message)
+-                    valid = false
+-                end
+-                if not valid then
+-                    local err_msg = type(err) == "table" and err.error_msg or tostring(err)
+-                    local resource_id = item.id or item.username or ""
+-
+-                    if not collect_all_errors then
+-                        return false, err_msg
+-                    end
+-                    is_valid = false
+-                    table_insert(validation_results, {
+-                        resource_type = key,
+-                        resource_id = resource_id,
+-                        index = index - 1,
+-                        error = err_msg
+-                    })
+-                end
+-
+-                -- check for duplicate IDs
+-                local duplicated, dup_err = check_duplicate(item, key, id_set)
+-                if duplicated then
+-                    if not collect_all_errors then
+-                        return false, dup_err
+-                    end
+-                    is_valid = false
+-                    table_insert(validation_results, {
+-                        resource_type = key,
+-                        resource_id = item.id or item.username or "",
+-                        index = index - 1,
+-                        error = dup_err
+-                    })
++                    return error_collector:get_result()
+                 end
+             end
+         end
+     end
+ 
+-    if collect_all_errors then
+-        return is_valid, validation_results
+-    end
+-
+-    return is_valid, nil
++    return error_collector:get_result()
+ end
+ 
+ 
