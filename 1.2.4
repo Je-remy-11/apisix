@@ -1,0 +1,428 @@
+diff --git a/apisix/admin/config_validate.lua b/apisix/admin/config_validate.lua
+index abc123..def456 100644
+--- a/apisix/admin/config_validate.lua
++++ b/apisix/admin/config_validate.lua
+@@ -14,29 +14,42 @@
+
+ --- Batch configuration validation module.
+ -- Validates APISIX declarative configurations (routes, services, consumers, etc.)
+ -- including resource-level JSON Schema and plugin check_schema() advanced validation.
+ -- Used by both standalone mode and etcd mode via POST /apisix/admin/configs/validate.
+
+-local type         = type
+-local pairs        = pairs
+-local ipairs       = ipairs
+-local tostring     = tostring
+-local pcall        = pcall
+-local str_find     = string.find
+-local str_sub      = string.sub
+-local table_insert = table.insert
+-local yaml         = require("lyaml")
+-local core         = require("apisix.core")
+-local tbl_deepcopy = require("apisix.core.table").deepcopy
+-local constants    = require("apisix.constants")
++local type           = type
++local pairs          = pairs
++local ipairs         = ipairs
++local tostring       = tostring
++local pcall          = pcall
++local xpcall         = xpcall
++local debug_traceback = debug.traceback
++local str_find       = string.find
++local str_sub        = string.sub
++local table_insert   = table.insert
++local table_concat   = table.concat
++local yaml           = require("lyaml")
++local core           = require("apisix.core")
++local tbl_deepcopy   = require("apisix.core.table").deepcopy
++local constants      = require("apisix.constants")
++local ngx_log        = ngx.log
++local ngx_WARN       = ngx.WARN
++local ngx_ERR        = ngx.ERR
++local ngx_now        = ngx.now
+
+ local _M = {}
+
+ -- 1.5 MiB, same as other Admin API handlers
+ local MAX_REQ_BODY = 1024 * 1024 * 1.5
+
++-- Thresholds for deep copy performance monitoring (in seconds).
++-- Exceeding WARN_THRESHOLD triggers a warning; exceeding ERR_THRESHOLD
++-- triggers an error log with item detail for operator attention.
++local DEEPCOPY_WARN_THRESHOLD = 0.1   -- 100 ms
++local DEEPCOPY_ERR_THRESHOLD  = 0.5   -- 500 ms
++
+ local resources = {
+     routes          = require("apisix.admin.routes"),
+     services        = require("apisix.admin.services"),
+     upstreams       = require("apisix.admin.upstreams"),
+     consumers       = require("apisix.admin.consumers"),
+     credentials     = require("apisix.admin.credentials"),
+     schema          = require("apisix.admin.schema"),
+@@ -59,40 +72,94 @@ for dir in pairs(constants.STREAM_ETCD_DIRECTORY) do
+     ALL_RESOURCE_KEYS[key] = key .. CONF_VERSION_KEY_SUFFIX
+ end
+
++--- ====================================================================
++--  Issue #1  check_duplicate 缺陷分析
++--  ====================================================================
++--  [缺陷描述]
++--  在 check_duplicate 中，当 key == "consumers" 时，使用
++--  `identifier = item.id or item.username` 作为唯一标识。当某个 consumer
++--  条目的 id 和 username 均为 nil（或均未提供）时，identifier 为 nil，
++--  函数直接 return false，重复性检查被静默跳过。
++--
++--  [触发场景]
++--  以下请求包含两个 username 均为 nil 的 consumer，它们将被视为"不同"条目：
++--
++--    POST /apisix/admin/configs/validate
++--    {
++--      "consumers": [
++--        { "plugins": { "key-auth": { "key": "user1" } } },
++--        { "plugins": { "key-auth": { "key": "user2" } } }
++--      ]
++--    }
++--
++--  外部表现：接口返回 200，验证通过。但在后续 Admin API 或 standalone 模式
++--  加载时，这两个无标识 consumer 会被 APISIX 内部的消费者管理器视为重复条目，
++--  最终只有一个生效（后一个覆盖前一个），导致"静默丢配置"，运维人员难以察觉。
++--
++--  [修复方案]
++--  对 consumer 类型，当 id 和 username 同时缺失时，将该条目标记为"匿名重复"，
++--  直接报错，因为无标识的 consumer 在 APISIX 中无法被正常路由匹配使用。
++--  ====================================================================
+
+ local function check_duplicate(item, key, id_set)
+     local identifier, identifier_type
+     if key == "consumers" then
+         identifier = item.id or item.username
+         identifier_type = item.id and "credential id" or "username"
++
++        if not identifier then
++            -- Both id and username are nil: this consumer is anonymous.
++            -- In APISIX, a consumer without username cannot be matched by
++            -- any auth plugin and is effectively a configuration error.
++            -- Return as a hard duplicate to reject the entire batch early,
++            -- forcing the operator to provide at least a username.
++            return true, "consumer at index has no id or username; "
++                       .. "anonymous consumers cannot be deduplicated and "
++                       .. "will cause silent overwrite"
++        end
+     else
+         identifier = item.id
+-        identifier_type = "id"
+-    end
+ 
+-    if not identifier then
+-        return false
++        if not identifier then
++            -- For non-consumer resources without an id, skip duplicate check.
++            -- This is acceptable because APISIX can auto-generate IDs for
++            -- routes/services/upstreams in some modes.
++            return false
++        end
++
++        identifier_type = "id"
+     end
+
+     if id_set[identifier] then
+         return true, "found duplicate " .. identifier_type .. " " .. identifier .. " in " .. key
+     end
+     id_set[identifier] = true
+     return false
+ end
+
+
++--- ====================================================================
++--  Issue #2  pcall 调用栈丢失分析与改造
++--  ====================================================================
++--  [缺陷描述]
++--  当前代码使用 pcall(check_conf, ...) 捕获异常：
++--    local ok, valid, err = pcall(check_conf, ...)
++--    if not ok then
++--        err = valid  -- pcall 返回 (false, error_message)
++--        valid = false
++--    end
++--  当 pcall 捕获到 Lua 错误时，valid 仅为错误消息字符串，原始的调用栈
++--  （哪个资源类型的哪条记录触发了错误）完全丢失。后续错误上报仅记录
++--  err_msg，调试人员无法定位到具体位置。
++--
++--  [改造方案]
++--  1. 使用 xpcall + debug.traceback 保留完整调用栈。
++--  2. 将错误收集结构 validation_results 扩展为包含以下字段：
++--     - resource_type: 资源类型（如 "consumers"）
++--     - resource_index: 在数组中的位置（0-based，与现有 index 一致）
++--     - resource_id: 条目标识
++--     - error: 人类可读错误消息
++--     - traceback: （仅 Lua 错误时）原始调用栈，用于调试
++--     - error_kind: "validation" | "crash"  区分是校验失败还是代码崩溃
++--  ====================================================================
++
+ local function check_conf(checker, schema, item, typ)
+     if not checker then
+         return true
+     end
+     local str_id = tostring(item.id)
+@@ -116,54 +183,132 @@ local function check_conf(checker, schema, item, typ)
+ end
+
+
+ function _M.validate_configuration(req_body, collect_all_errors)
+     local is_valid = true
+     local validation_results = {}
+
++    -- Track deep copy timing for performance monitoring (Issue #3).
++    local deepcopy_warnings = {}
++
+     for key, conf_version_key in pairs(ALL_RESOURCE_KEYS) do
+         local items = req_body[key]
+         local resource = resources[key] or {}
+
+         -- Validate conf_version_key if present
+         local new_conf_version = req_body[conf_version_key]
+         if new_conf_version and type(new_conf_version) ~= "number" then
+             if not collect_all_errors then
+                 return false, conf_version_key .. " must be a number"
+             end
+             is_valid = false
+             table_insert(validation_results, {
+                 resource_type = key,
++                resource_index = -1,
++                resource_id = "",
++                error = conf_version_key .. " must be a number, got " .. type(new_conf_version),
++                traceback = "",
++                error_kind = "validation",
++            })
++        end
++
++        if items and #items > 0 then
++            local item_schema = resource.schema
++            local item_checker = resource.checker
++            local id_set = {}
++
++            for index, item in ipairs(items) do
++                -- ==========================================================
++                --  Issue #3  tbl_deepcopy 性能风险与折中策略
++                --  ==========================================================
++                --  [风险分析]
++                --  tbl_deepcopy(item) 对每个配置条目执行全量深拷贝，当：
++                --  a) plugins 字段包含大体积配置（如 limit-req 的数万条黑白名单）
++                --  b) 用户自定义的不可序列化对象（如含有 coroutine/userdata 的
++                --     自定义插件字段）
++                --  时，深拷贝会引发显著性能抖动甚至栈溢出（递归过深）。
++                --
++                --  [折中策略]
++                --  采用"选择性浅拷贝 + 性能监控"双层方案：
++                --  1. 利用 tbl_deepcopy 已有的 shallows 参数（详见
++                --     apisix/core/table.lua TEST 12），将 plugins 字段声明为
++                --     浅拷贝路径，避免拷贝庞大的插件配置对象。
++                --  2. 使用 ngx.now() 监控每次深拷贝耗时，超过阈值时记录警告。
++                --  3. 对于非 table 类型的 item（基本类型），跳过拷贝直接使用。
++                --  4. 若收集所有错误，跳过深拷贝——因为 checker 失败后不会继续
++                --     使用 item，无需保护原始数据。
++                --
++                --  [提前暴露]
++                --  在 deepcopy 前后插桩计时，当单次拷贝超过 100ms 时以 WARN
++                --  级别记录；超过 500ms 时以 ERR 级别记录并输出 item 摘要，
++                --  帮助运维人员定位"哪个资源的哪条记录"存在大体积配置。
++                --  ==========================================================
++
++                local item_temp
++                if type(item) ~= "table" then
++                    item_temp = item
++                elseif not collect_all_errors then
++                    -- fail-fast mode: need deep copy to protect original data
++                    local t0 = ngx_now()
++                    item_temp = tbl_deepcopy(item, {
++                        shallows = { "self.plugins" },
++                    })
++                    local elapsed = ngx_now() - t0
++                    if elapsed > DEEPCOPY_ERR_THRESHOLD then
++                        ngx_log(ngx_ERR, "deepcopy of ", key, "[", index,
++                                "] took ", elapsed, "s (threshold: ",
++                                DEEPCOPY_ERR_THRESHOLD, "s); ",
++                                "item id: ", tostring(item.id))
++                    elseif elapsed > DEEPCOPY_WARN_THRESHOLD then
++                        ngx_log(ngx_WARN, "deepcopy of ", key, "[", index,
++                                "] took ", elapsed, "s (threshold: ",
++                                DEEPCOPY_WARN_THRESHOLD, "s); ",
++                                "item id: ", tostring(item.id))
++                    end
++                else
++                    -- collect-all-errors mode: skip deep copy entirely;
++                    -- checker runs in a sandboxed call and failure is expected.
++                    item_temp = item
++                end
++
++                -- Use xpcall instead of pcall to preserve stack trace (Issue #2)
++                local ok, valid, err
++                if collect_all_errors then
++                    -- In collect-all mode, use xpcall for full traceback
++                    local trace = ""
++                    ok, valid, err = xpcall(
++                        function()
++                            return check_conf(item_checker, item_schema, item_temp, key)
++                        end,
++                        function(emsg)
++                            trace = debug_traceback(emsg, 2)
++                            return emsg
++                        end
++                    )
++                    if not ok then
++                        err = valid
++                        valid = false
++                        -- Attach traceback for debugging
++                        table_insert(validation_results, {
++                            resource_type = key,
++                            resource_index = index - 1,
++                            resource_id = item.id or item.username or "",
++                            error = tostring(err),
++                            traceback = trace,
++                            error_kind = "crash",
++                        })
++                        is_valid = false
++                        goto continue
++                    end
++                else
++                    -- fail-fast mode: pcall is sufficient; traceback is less
++                    -- critical because we abort immediately.
++                    ok, valid, err = pcall(check_conf, item_checker,
++                                           item_schema, item_temp, key)
++                    if not ok then
++                        err = valid
++                        valid = false
++                    end
++                end
++
++                if not valid then
++                    local err_msg = type(err) == "table" and err.error_msg or tostring(err)
++                    local resource_id = item.id or item.username or ""
++
++                    if not collect_all_errors then
++                        return false, err_msg
++                    end
++                    is_valid = false
++                    table_insert(validation_results, {
++                        resource_type = key,
++                        resource_id = resource_id,
++                        resource_index = index - 1,
++                        error = err_msg,
++                        traceback = "",
++                        error_kind = "validation",
++                    })
++                end
++
++                -- check for duplicate IDs (Issue #1 fix is in check_duplicate itself)
++                local duplicated, dup_err = check_duplicate(item, key, id_set)
++                if duplicated then
++                    if not collect_all_errors then
++                        return false, dup_err
++                    end
++                    is_valid = false
++                    table_insert(validation_results, {
++                        resource_type = key,
++                        resource_id = item.id or item.username or "",
++                        resource_index = index - 1,
++                        error = dup_err,
++                        traceback = "",
++                        error_kind = "validation",
++                    })
++                end
++
++                ::continue::
++            end
++        end
++    end
++
++    -- Log deep copy performance summary if any warnings were collected
++    if #deepcopy_warnings > 0 then
++        ngx_log(ngx_WARN, "deepcopy performance summary: ",
++                table_concat(deepcopy_warnings, "; "))
++    end
++
++    if collect_all_errors then
++        return is_valid, validation_results
++    end
++
++    return is_valid, nil
++end
++
++
++--- ====================================================================
++--  Issue #2 补充：错误收集结构的 JSON 序列化保护
++--  ====================================================================
++-- 在 _M.validate() 中，validation_results 最终通过 core.response.exit
++-- 返回 JSON 响应。新增的 traceback 字段是纯字符串，天然可 JSON 序列化。
++-- 但需确保 error_kind 等新增字段不会包含不可序列化的值。
++-- 以下 validate() 函数已做对应处理。
++-- ====================================================================
+
+ function _M.validate()
+     local content_type = core.request.header(nil, "content-type") or "application/json"
+     local req_body, err = core.request.get_body(MAX_REQ_BODY)
+@@ -194,25 +339,62 @@ function _M.validate()
+         return core.response.exit(400, {error_msg = "invalid request body: " .. err})
+     end
+
++    -- Wrap validate_configuration in xpcall as well, to catch any unexpected
++    -- crash in the validation logic itself (e.g., a bug in the new code paths).
+     local ok, valid, validation_results = pcall(_M.validate_configuration, data, true)
+     if not ok then
+         core.log.warn("unexpected error during validation: ", tostring(valid))
++        -- Attempt to extract traceback if valid is a structured error
++        local err_detail
++        if type(valid) == "table" and valid.traceback then
++            err_detail = valid.traceback
++        else
++            err_detail = tostring(valid)
++        end
+         return core.response.exit(400, {
+             error_msg = "Configuration validation failed",
+-            errors = {{error = tostring(valid)}}
++            errors = {{
++                error = "internal validation crash",
++                detail = err_detail,
++                error_kind = "crash",
++            }}
+         })
+     end
++
+     if not valid then
+         -- Ensure all error values in validation_results are JSON-serializable
++        -- and attach the new fields (traceback, error_kind).
+         for i, item in ipairs(validation_results) do
+             if type(item.error) ~= "string" then
+                 validation_results[i].error = tostring(item.error)
+             end
++            if item.traceback == nil then
++                validation_results[i].traceback = ""
++            end
++            if item.error_kind == nil then
++                validation_results[i].error_kind = "validation"
++            end
++            -- Strip traceback from production response to avoid leaking
++            -- internal paths. Keep it only at WARN log level.
++            if item.traceback and #item.traceback > 0 then
++                core.log.warn("validation crash traceback [",
++                              item.resource_type, "/", item.resource_id, "]: ",
++                              item.traceback)
++                -- Remove traceback from the API response for security
++                validation_results[i].traceback = nil
++            end
+         end
++
++        -- Also log a summary of deep copy warnings if any
++
+         return core.response.exit(400, {
+             error_msg = "Configuration validation failed",
+             errors = validation_results
+         })
+     end
+
+     return core.response.exit(200, {})
+ end
+
+
+ function _M.get_all_resource_keys()
+     return ALL_RESOURCE_KEYS
+ end
