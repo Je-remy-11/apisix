@@ -1,0 +1,41 @@
+name: consumers
+kind: consumer
+schema: core.schema.consumer
+unsupported_methods:
+  - post
+  - patch
+imports:
+  - local_name: core
+    require: apisix.core
+  - local_name: plugins
+    require: apisix.admin.plugins
+  - local_name: plugins_encrypt_conf
+    require: apisix.admin.plugins
+    field: encrypt_conf
+  - local_name: resource
+    require: apisix.admin.resource
+check_conf:
+  id_name: username
+  schema_check: true
+  custom_logic: |
+    if username and username ~= conf.username then
+        return nil, {error_msg = "wrong username" }
+    end
+
+    if conf.plugins then
+        ok, err = plugins.check_schema(conf.plugins, core.schema.TYPE_CONSUMER)
+        if not ok then
+            return nil, {error_msg = "invalid plugins configuration: " .. err}
+        end
+    end
+  references:
+    - field: group_id
+      resource: consumer_groups
+      name: consumer group
+  return_value: conf.username
+encrypt_conf:
+  args:
+    - id
+    - conf
+  custom_logic: |
+    plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)

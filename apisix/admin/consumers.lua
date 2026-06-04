@@ -14,13 +14,12 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 --
-local core    = require("apisix.core")
+local core = require("apisix.core")
 local plugins = require("apisix.admin.plugins")
 local plugins_encrypt_conf = require("apisix.admin.plugins").encrypt_conf
 local resource = require("apisix.admin.resource")
 
-
-local function check_conf(username, conf, need_username, schema, opts)
+local function check_conf(username, conf, need_id, schema, opts)
     opts = opts or {}
     local ok, err = core.schema.check(schema, conf)
     if not ok then
@@ -57,11 +56,9 @@ local function check_conf(username, conf, need_username, schema, opts)
     return conf.username
 end
 
-
 local function encrypt_conf(id, conf)
     plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
 end
-
 
 return resource.new({
     name = "consumers",
