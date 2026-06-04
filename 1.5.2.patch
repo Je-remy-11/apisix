@@ -1,0 +1,205 @@
+diff --git a/apisix/admin/consumers.lua b/apisix/admin/consumers.lua
+index 32b1a944..d789ae6e 100644
+--- a/apisix/admin/consumers.lua
++++ b/apisix/admin/consumers.lua
+@@ -20,6 +20,46 @@ local plugins_encrypt_conf = require("apisix.admin.plugins").encrypt_conf
+ local resource = require("apisix.admin.resource")
+ 
+ 
++local consumers
++
++
++local function get_group_id_etcd_get(opts)
++    if opts and opts.etcd_get then
++        return opts.etcd_get
++    end
++
++    if consumers and consumers.group_id_etcd_get then
++        return consumers.group_id_etcd_get
++    end
++
++    return core.etcd.get
++end
++
++
++local function check_group_id(group_id, opts)
++    opts = opts or {}
++    if not group_id or opts.skip_references_check then
++        return true
++    end
++
++    local key = "/consumer_groups/" .. group_id
++    local res, err = get_group_id_etcd_get(opts)(key)
++    if not res then
++        return nil, {error_msg = "failed to fetch consumer group info by "
++                                 .. "consumer group id [" .. group_id .. "]: "
++                                 .. err}
++    end
++
++    if res.status ~= 200 then
++        return nil, {error_msg = "failed to fetch consumer group info by "
++                                 .. "consumer group id [" .. group_id .. "], "
++                                 .. "response code: " .. res.status}
++    end
++
++    return true
++end
++
++
+ local function check_conf(username, conf, need_username, schema, opts)
+     opts = opts or {}
+     local ok, err = core.schema.check(schema, conf)
+@@ -38,20 +78,9 @@ local function check_conf(username, conf, need_username, schema, opts)
+         end
+     end
+ 
+-    if conf.group_id and not opts.skip_references_check then
+-        local key = "/consumer_groups/" .. conf.group_id
+-        local res, err = core.etcd.get(key)
+-        if not res then
+-            return nil, {error_msg = "failed to fetch consumer group info by "
+-                                     .. "consumer group id [" .. conf.group_id .. "]: "
+-                                     .. err}
+-        end
+-
+-        if res.status ~= 200 then
+-            return nil, {error_msg = "failed to fetch consumer group info by "
+-                                     .. "consumer group id [" .. conf.group_id .. "], "
+-                                     .. "response code: " .. res.status}
+-        end
++    ok, err = check_group_id(conf.group_id, opts)
++    if not ok then
++        return nil, err
+     end
+ 
+     return conf.username
+@@ -63,7 +92,7 @@ local function encrypt_conf(id, conf)
+ end
+ 
+ 
+-return resource.new({
++consumers = resource.new({
+     name = "consumers",
+     kind = "consumer",
+     schema = core.schema.consumer,
+@@ -71,3 +100,8 @@ return resource.new({
+     encrypt_conf = encrypt_conf,
+     unsupported_methods = {"post", "patch"}
+ })
++
++consumers.check_group_id = check_group_id
++consumers.group_id_etcd_get = nil
++
++return consumers
+diff --git a/t/admin/consumers2.t b/t/admin/consumers2.t
+index 6e351d02..186be724 100644
+--- a/t/admin/consumers2.t
++++ b/t/admin/consumers2.t
+@@ -174,3 +174,107 @@ __DATA__
+     }
+ --- response_body
+ {"error_msg":"wrong username"}
++
++
++
++=== TEST 6: check_conf unit with mocked group fetch success
++--- config
++    location /t {
++        content_by_lua_block {
++            local consumers = require("apisix.admin.consumers")
++            local ok, err = consumers.checker(nil, {
++                username = "jack",
++                group_id = "company_a"
++            }, false, consumers.schema, {
++                etcd_get = function(key)
++                    assert(key == "/consumer_groups/company_a")
++                    return {status = 200}
++                end
++            })
++
++            if not ok then
++                ngx.say(err.error_msg)
++                return
++            end
++
++            ngx.say(ok)
++        }
++    }
++--- response_body
++jack
++
++
++
++=== TEST 7: check_conf unit with mocked missing group
++--- config
++    location /t {
++        content_by_lua_block {
++            local consumers = require("apisix.admin.consumers")
++            local ok, err = consumers.checker(nil, {
++                username = "jack",
++                group_id = "company_a"
++            }, false, consumers.schema, {
++                etcd_get = function(key)
++                    assert(key == "/consumer_groups/company_a")
++                    return {status = 404}
++                end
++            })
++
++            assert(not ok)
++            ngx.say(err.error_msg)
++        }
++    }
++--- response_body
++failed to fetch consumer group info by consumer group id [company_a], response code: 404
++
++
++
++=== TEST 8: check_conf unit with mocked etcd failure
++--- config
++    location /t {
++        content_by_lua_block {
++            local consumers = require("apisix.admin.consumers")
++            local ok, err = consumers.checker(nil, {
++                username = "jack",
++                group_id = "company_a"
++            }, false, consumers.schema, {
++                etcd_get = function(key)
++                    assert(key == "/consumer_groups/company_a")
++                    return nil, "mocked etcd failure"
++                end
++            })
++
++            assert(not ok)
++            ngx.say(err.error_msg)
++        }
++    }
++--- response_body
++failed to fetch consumer group info by consumer group id [company_a]: mocked etcd failure
++
++
++
++=== TEST 9: resource check_conf uses injected group fetcher
++--- config
++    location /t {
++        content_by_lua_block {
++            local consumers = require("apisix.admin.consumers")
++            local old_etcd_get = consumers.group_id_etcd_get
++
++            consumers.group_id_etcd_get = function(key)
++                assert(key == "/consumer_groups/company_a")
++                return nil, "mocked etcd failure"
++            end
++
++            local ok, err = consumers:check_conf(nil, {
++                username = "jack",
++                group_id = "company_a"
++            }, false)
++
++            consumers.group_id_etcd_get = old_etcd_get
++
++            assert(not ok)
++            ngx.say(err.error_msg)
++        }
++    }
++--- response_body
++failed to fetch consumer group info by consumer group id [company_a]: mocked etcd failure

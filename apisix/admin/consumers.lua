@@ -20,6 +20,46 @@ local plugins_encrypt_conf = require("apisix.admin.plugins").encrypt_conf
 local resource = require("apisix.admin.resource")
 
 
+local consumers
+
+
+local function get_group_id_etcd_get(opts)
+    if opts and opts.etcd_get then
+        return opts.etcd_get
+    end
+
+    if consumers and consumers.group_id_etcd_get then
+        return consumers.group_id_etcd_get
+    end
+
+    return core.etcd.get
+end
+
+
+local function check_group_id(group_id, opts)
+    opts = opts or {}
+    if not group_id or opts.skip_references_check then
+        return true
+    end
+
+    local key = "/consumer_groups/" .. group_id
+    local res, err = get_group_id_etcd_get(opts)(key)
+    if not res then
+        return nil, {error_msg = "failed to fetch consumer group info by "
+                                 .. "consumer group id [" .. group_id .. "]: "
+                                 .. err}
+    end
+
+    if res.status ~= 200 then
+        return nil, {error_msg = "failed to fetch consumer group info by "
+                                 .. "consumer group id [" .. group_id .. "], "
+                                 .. "response code: " .. res.status}
+    end
+
+    return true
+end
+
+
 local function check_conf(username, conf, need_username, schema, opts)
     opts = opts or {}
     local ok, err = core.schema.check(schema, conf)
@@ -38,20 +78,9 @@ local function check_conf(username, conf, need_username, schema, opts)
         end
     end
 
-    if conf.group_id and not opts.skip_references_check then
-        local key = "/consumer_groups/" .. conf.group_id
-        local res, err = core.etcd.get(key)
-        if not res then
-            return nil, {error_msg = "failed to fetch consumer group info by "
-                                     .. "consumer group id [" .. conf.group_id .. "]: "
-                                     .. err}
-        end
-
-        if res.status ~= 200 then
-            return nil, {error_msg = "failed to fetch consumer group info by "
-                                     .. "consumer group id [" .. conf.group_id .. "], "
-                                     .. "response code: " .. res.status}
-        end
+    ok, err = check_group_id(conf.group_id, opts)
+    if not ok then
+        return nil, err
     end
 
     return conf.username
@@ -63,7 +92,7 @@ local function encrypt_conf(id, conf)
 end
 
 
-return resource.new({
+consumers = resource.new({
     name = "consumers",
     kind = "consumer",
     schema = core.schema.consumer,
@@ -71,3 +100,8 @@ return resource.new({
     encrypt_conf = encrypt_conf,
     unsupported_methods = {"post", "patch"}
 })
+
+consumers.check_group_id = check_group_id
+consumers.group_id_etcd_get = nil
+
+return consumers

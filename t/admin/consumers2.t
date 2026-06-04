@@ -174,3 +174,107 @@ __DATA__
     }
 --- response_body
 {"error_msg":"wrong username"}
+
+
+
+=== TEST 6: check_conf unit with mocked group fetch success
+--- config
+    location /t {
+        content_by_lua_block {
+            local consumers = require("apisix.admin.consumers")
+            local ok, err = consumers.checker(nil, {
+                username = "jack",
+                group_id = "company_a"
+            }, false, consumers.schema, {
+                etcd_get = function(key)
+                    assert(key == "/consumer_groups/company_a")
+                    return {status = 200}
+                end
+            })
+
+            if not ok then
+                ngx.say(err.error_msg)
+                return
+            end
+
+            ngx.say(ok)
+        }
+    }
+--- response_body
+jack
+
+
+
+=== TEST 7: check_conf unit with mocked missing group
+--- config
+    location /t {
+        content_by_lua_block {
+            local consumers = require("apisix.admin.consumers")
+            local ok, err = consumers.checker(nil, {
+                username = "jack",
+                group_id = "company_a"
+            }, false, consumers.schema, {
+                etcd_get = function(key)
+                    assert(key == "/consumer_groups/company_a")
+                    return {status = 404}
+                end
+            })
+
+            assert(not ok)
+            ngx.say(err.error_msg)
+        }
+    }
+--- response_body
+failed to fetch consumer group info by consumer group id [company_a], response code: 404
+
+
+
+=== TEST 8: check_conf unit with mocked etcd failure
+--- config
+    location /t {
+        content_by_lua_block {
+            local consumers = require("apisix.admin.consumers")
+            local ok, err = consumers.checker(nil, {
+                username = "jack",
+                group_id = "company_a"
+            }, false, consumers.schema, {
+                etcd_get = function(key)
+                    assert(key == "/consumer_groups/company_a")
+                    return nil, "mocked etcd failure"
+                end
+            })
+
+            assert(not ok)
+            ngx.say(err.error_msg)
+        }
+    }
+--- response_body
+failed to fetch consumer group info by consumer group id [company_a]: mocked etcd failure
+
+
+
+=== TEST 9: resource check_conf uses injected group fetcher
+--- config
+    location /t {
+        content_by_lua_block {
+            local consumers = require("apisix.admin.consumers")
+            local old_etcd_get = consumers.group_id_etcd_get
+
+            consumers.group_id_etcd_get = function(key)
+                assert(key == "/consumer_groups/company_a")
+                return nil, "mocked etcd failure"
+            end
+
+            local ok, err = consumers:check_conf(nil, {
+                username = "jack",
+                group_id = "company_a"
+            }, false)
+
+            consumers.group_id_etcd_get = old_etcd_get
+
+            assert(not ok)
+            ngx.say(err.error_msg)
+        }
+    }
+--- response_body
+failed to fetch consumer group info by consumer group id [company_a]: mocked etcd failure
