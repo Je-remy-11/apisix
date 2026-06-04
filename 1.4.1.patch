@@ -1,0 +1,447 @@
+diff --git a/1.1.1.patch b/1.1.1.patch
+new file mode 100644
+index 00000000..a5e25f54
+--- /dev/null
++++ b/1.1.1.patch
+@@ -0,0 +1,408 @@
++diff --git a/1.3.2.patch b/1.3.2.patch
++new file mode 100644
++index 00000000..e69de29b
++diff --git a/apisix/admin/config_validate.lua b/apisix/admin/config_validate.lua
++index b4d4b090..e28e995f 100644
++--- a/apisix/admin/config_validate.lua
+++++ b/apisix/admin/config_validate.lua
++@@ -35,7 +35,6 @@ local constants    = require("apisix.constants")
++ 
++ local _M = {}
++ 
++--- 1.5 MiB, same as other Admin API handlers
++ local MAX_REQ_BODY = 1024 * 1024 * 1.5
++ 
++ local resources = {
++@@ -67,133 +66,274 @@ for dir in pairs(constants.STREAM_ETCD_DIRECTORY) do
++     ALL_RESOURCE_KEYS[key] = key .. CONF_VERSION_KEY_SUFFIX
++ end
++ 
+++local function resolve_default_resource_id(item)
+++    return item.id or ""
+++end
++ 
++-local function check_duplicate(item, key, id_set)
++-    local identifier, identifier_type
++-    if key == "consumers" then
++-        identifier = item.id or item.username
++-        identifier_type = item.id and "credential id" or "username"
++-    else
++-        identifier = item.id
++-        identifier_type = "id"
+++
+++local function resolve_consumer_resource_id(item)
+++    return item.id or item.username or ""
+++end
+++
+++
+++local function resolve_default_duplicate_identifier(item)
+++    return item.id, "id"
+++end
+++
+++
+++local function resolve_consumer_duplicate_identifier(item)
+++    if item.id then
+++        return item.id, "credential id"
++     end
++ 
++-    if not identifier then
++-        return false
+++    return item.username, "username"
+++end
+++
+++
+++local function build_default_validation_plan(registration)
+++    return {
+++        checker = registration.checker,
+++        schema = registration.schema,
+++        opts = {
+++            skip_references_check = true,
+++        },
+++    }
+++end
+++
+++
+++local function build_consumer_validation_plan(registration, item)
+++    local item_id = item.id
+++    if item_id and str_find(tostring(item_id), "/credentials/", 1, true) then
+++        return {
+++            checker = resources.credentials.checker,
+++            schema = resources.credentials.schema,
+++            opts = {
+++                skip_references_check = true,
+++            },
+++        }
+++    end
+++
+++    return build_default_validation_plan(registration)
+++end
+++
+++
+++local function build_secret_validation_plan(registration, item)
+++    local plan = build_default_validation_plan(registration)
+++    local raw_id = item.id
+++    local str_id = raw_id and tostring(raw_id) or ""
+++    local idx = str_find(str_id, "/", 1, true)
+++
+++    if not idx then
+++        return nil, {
+++            error_msg = "invalid secret id: " .. str_id
+++        }
+++    end
+++
+++    plan.opts.secret_type = str_sub(str_id, 1, idx - 1)
+++    return plan
+++end
+++
+++
+++local DEFAULT_RESOURCE_METADATA = {
+++    resolve_resource_id = resolve_default_resource_id,
+++    resolve_duplicate_identifier = resolve_default_duplicate_identifier,
+++    build_validation_plan = build_default_validation_plan,
+++}
+++
+++
+++local RESOURCE_VALIDATION_METADATA = {
+++    consumers = {
+++        resolve_resource_id = resolve_consumer_resource_id,
+++        resolve_duplicate_identifier = resolve_consumer_duplicate_identifier,
+++        build_validation_plan = build_consumer_validation_plan,
+++    },
+++    secrets = {
+++        build_validation_plan = build_secret_validation_plan,
+++    },
+++}
+++
+++
+++local function build_resource_registration(key, conf_version_key)
+++    local resource = resources[key] or {}
+++    local metadata = RESOURCE_VALIDATION_METADATA[key] or {}
+++
+++    return {
+++        key = key,
+++        conf_version_key = conf_version_key,
+++        checker = resource.checker,
+++        schema = resource.schema,
+++        resolve_resource_id = metadata.resolve_resource_id or DEFAULT_RESOURCE_METADATA.resolve_resource_id,
+++        resolve_duplicate_identifier = metadata.resolve_duplicate_identifier
+++            or DEFAULT_RESOURCE_METADATA.resolve_duplicate_identifier,
+++        build_validation_plan = metadata.build_validation_plan
+++            or DEFAULT_RESOURCE_METADATA.build_validation_plan,
+++    }
+++end
+++
+++
+++local function build_resource_registry()
+++    local registry = {}
+++
+++    for key, conf_version_key in pairs(ALL_RESOURCE_KEYS) do
+++        registry[key] = build_resource_registration(key, conf_version_key)
++     end
++ 
++-    if id_set[identifier] then
++-        return true, "found duplicate " .. identifier_type .. " " .. identifier .. " in " .. key
+++    return registry
+++end
+++
+++
+++local RESOURCE_REGISTRY = build_resource_registry()
+++
+++
+++local function normalize_error(err)
+++    if type(err) == "table" then
+++        return err.error_msg or tostring(err)
++     end
++-    id_set[identifier] = true
++-    return false
+++
+++    return tostring(err)
++ end
++ 
++ 
++-local function check_conf(checker, schema, item, typ)
++-    if not checker then
+++local function new_error_collector(collect_all_errors)
+++    local collector = {
+++        collect_all_errors = collect_all_errors,
+++        is_valid = true,
+++        errors = {},
+++    }
+++
+++    function collector:add(entry, fail_fast_error)
+++        local err_msg = normalize_error(entry.error)
+++        if not self.collect_all_errors then
+++            return false, fail_fast_error or err_msg
+++        end
+++
+++        self.is_valid = false
+++        entry.error = err_msg
+++        table_insert(self.errors, entry)
++         return true
++     end
++-    local str_id = tostring(item.id)
++-    if typ == "consumers" and
++-        core.string.find(str_id, "/credentials/") then
++-        local credential_checker = resources.credentials.checker
++-        local credential_schema = resources.credentials.schema
++-        return credential_checker(item.id, item, false, credential_schema, {
++-            skip_references_check = true,
++-        })
+++
+++    function collector:result()
+++        if self.collect_all_errors then
+++            return self.is_valid, self.errors
+++        end
+++
+++        return self.is_valid, nil
++     end
++ 
++-    local secret_type
++-    if typ == "secrets" then
++-        local idx = str_find(str_id or "", "/")
++-        if not idx then
++-            return false, {
++-                error_msg = "invalid secret id: " .. (str_id or "")
++-            }
+++    return collector
+++end
+++
+++
+++local function create_duplicate_detector(registration)
+++    local seen = {}
+++
+++    return function(item)
+++        local identifier, identifier_type = registration.resolve_duplicate_identifier(item)
+++        if not identifier then
+++            return false
++         end
++-        secret_type = str_sub(str_id, 1, idx - 1)
+++
+++        if seen[identifier] then
+++            return true, "found duplicate " .. identifier_type .. " " .. identifier
+++                .. " in " .. registration.key
+++        end
+++
+++        seen[identifier] = true
+++        return false
++     end
++-    return checker(item.id, item, false, schema, {
++-        secret_type = secret_type,
++-        skip_references_check = true,
++-    })
++ end
++ 
++ 
++-function _M.validate_configuration(req_body, collect_all_errors)
++-    local is_valid = true
++-    local validation_results = {}
+++local function run_single_record_validation(registration, item)
+++    local plan, err = registration.build_validation_plan(registration, item)
+++    if not plan then
+++        return false, err
+++    end
++ 
++-    for key, conf_version_key in pairs(ALL_RESOURCE_KEYS) do
++-        local items = req_body[key]
++-        local resource = resources[key] or {}
++-
++-        -- Validate conf_version_key if present
++-        local new_conf_version = req_body[conf_version_key]
++-        if new_conf_version and type(new_conf_version) ~= "number" then
++-            if not collect_all_errors then
++-                return false, conf_version_key .. " must be a number"
++-            end
++-            is_valid = false
++-            table_insert(validation_results, {
++-                resource_type = key,
++-                error = conf_version_key .. " must be a number, got " .. type(new_conf_version)
+++    if not plan.checker then
+++        return true
+++    end
+++
+++    return plan.checker(item.id, item, false, plan.schema, plan.opts)
+++end
+++
+++
+++local function validate_conf_version(registration, req_body, collector)
+++    local new_conf_version = req_body[registration.conf_version_key]
+++    if new_conf_version and type(new_conf_version) ~= "number" then
+++        return collector:add({
+++            resource_type = registration.key,
+++            error = registration.conf_version_key .. " must be a number, got " .. type(new_conf_version)
+++        }, registration.conf_version_key .. " must be a number")
+++    end
+++
+++    return true
+++end
+++
+++
+++local function validate_resource_items(registration, items, collector)
+++    if not items or #items == 0 then
+++        return true
+++    end
+++
+++    local detect_duplicate = create_duplicate_detector(registration)
+++
+++    for index, item in ipairs(items) do
+++        local item_temp = tbl_deepcopy(item)
+++        local ok, valid, err = pcall(run_single_record_validation, registration, item_temp)
+++        if not ok then
+++            err = valid
+++            valid = false
+++        end
+++
+++        if not valid then
+++            local continue, fail_fast_error = collector:add({
+++                resource_type = registration.key,
+++                resource_id = registration.resolve_resource_id(item),
+++                index = index - 1,
+++                error = err,
++             })
+++            if not continue then
+++                return false, fail_fast_error
+++            end
++         end
++ 
++-        if items and #items > 0 then
++-            local item_schema = resource.schema
++-            local item_checker = resource.checker
++-            local id_set = {}
++-
++-            for index, item in ipairs(items) do
++-                local item_temp = tbl_deepcopy(item)
++-                local ok, valid, err = pcall(check_conf, item_checker, item_schema, item_temp, key)
++-                if not ok then
++-                    -- checker threw an error
++-                    err = valid  -- pcall returns (false, error_message)
++-                    valid = false
++-                end
++-                if not valid then
++-                    local err_msg = type(err) == "table" and err.error_msg or tostring(err)
++-                    local resource_id = item.id or item.username or ""
++-
++-                    if not collect_all_errors then
++-                        return false, err_msg
++-                    end
++-                    is_valid = false
++-                    table_insert(validation_results, {
++-                        resource_type = key,
++-                        resource_id = resource_id,
++-                        index = index - 1,
++-                        error = err_msg
++-                    })
++-                end
++-
++-                -- check for duplicate IDs
++-                local duplicated, dup_err = check_duplicate(item, key, id_set)
++-                if duplicated then
++-                    if not collect_all_errors then
++-                        return false, dup_err
++-                    end
++-                    is_valid = false
++-                    table_insert(validation_results, {
++-                        resource_type = key,
++-                        resource_id = item.id or item.username or "",
++-                        index = index - 1,
++-                        error = dup_err
++-                    })
++-                end
+++        local duplicated, dup_err = detect_duplicate(item)
+++        if duplicated then
+++            local continue, fail_fast_error = collector:add({
+++                resource_type = registration.key,
+++                resource_id = registration.resolve_resource_id(item),
+++                index = index - 1,
+++                error = dup_err,
+++            })
+++            if not continue then
+++                return false, fail_fast_error
++             end
++         end
++     end
++ 
++-    if collect_all_errors then
++-        return is_valid, validation_results
+++    return true
+++end
+++
+++
+++function _M.validate_configuration(req_body, collect_all_errors)
+++    local collector = new_error_collector(collect_all_errors)
+++
+++    for key in pairs(ALL_RESOURCE_KEYS) do
+++        local registration = RESOURCE_REGISTRY[key]
+++        local continue, err = validate_conf_version(registration, req_body, collector)
+++        if not continue then
+++            return false, err
+++        end
+++
+++        continue, err = validate_resource_items(registration, req_body[key], collector)
+++        if not continue then
+++            return false, err
+++        end
++     end
++ 
++-    return is_valid, nil
+++    return collector:result()
++ end
++ 
++ 
++@@ -234,7 +374,7 @@ function _M.validate()
++         })
++     end
++     if not valid then
++-        -- Ensure all error values in validation_results are JSON-serializable
+++        validation_results = validation_results or {}
++         for i, item in ipairs(validation_results) do
++             if type(item.error) ~= "string" then
++                 validation_results[i].error = tostring(item.error)
++@@ -260,4 +400,9 @@ function _M.get_resources()
++ end
++ 
++ 
+++function _M.get_resource_registry()
+++    return RESOURCE_REGISTRY
+++end
+++
+++
++ return _M
+diff --git a/1.4.1.patch b/1.4.1.patch
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/apisix/admin/config_validate.lua b/apisix/admin/config_validate.lua
+index b4d4b090..67d47bd9 100644
+--- a/apisix/admin/config_validate.lua
++++ b/apisix/admin/config_validate.lua
+@@ -113,12 +113,12 @@ local function check_conf(checker, schema, item, typ)
+             }
+         end
+         secret_type = str_sub(str_id, 1, idx - 1)
+-    end
++    return build_default_validation_plan(registration, item)
+     return checker(item.id, item, false, schema, {
+         secret_type = secret_type,
+         skip_references_check = true,
+     })
+-end
++    local plan = build_default_validation_plan(registration, item)
+ 
+ 
+ function _M.validate_configuration(req_body, collect_all_errors)
+diff --git a/apisix/admin/consumers.lua b/apisix/admin/consumers.lua
+index 32b1a944..7f3c77f7 100644
+--- a/apisix/admin/consumers.lua
++++ b/apisix/admin/consumers.lua
+@@ -69,5 +69,5 @@ return resource.new({
+     schema = core.schema.consumer,
+     checker = check_conf,
+     encrypt_conf = encrypt_conf,
+-    unsupported_methods = {"post", "patch"}
++    unsupported_methods = {"post"}
+ })

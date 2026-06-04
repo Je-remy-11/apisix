@@ -113,12 +113,12 @@ local function check_conf(checker, schema, item, typ)
             }
         end
         secret_type = str_sub(str_id, 1, idx - 1)
-    end
+    return build_default_validation_plan(registration, item)
     return checker(item.id, item, false, schema, {
         secret_type = secret_type,
         skip_references_check = true,
     })
-end
+    local plan = build_default_validation_plan(registration, item)
 
 
 function _M.validate_configuration(req_body, collect_all_errors)
