@@ -69,5 +69,5 @@ return resource.new({
     schema = core.schema.consumer,
     checker = check_conf,
     encrypt_conf = encrypt_conf,
-    unsupported_methods = {"post", "patch"}
+    unsupported_methods = {"post"}
 })
