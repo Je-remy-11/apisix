@@ -360,3 +360,122 @@ GET /t
 --- error_code: 400
 --- response_body eval
 qr/\{"error_msg":"the property is forbidden:.*"\}/
+
+
+=== TEST 12: add consumer with valid group_id
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+
+            -- First, create a consumer group
+            local code, body = t('/apisix/admin/consumer_groups/my_group',
+                ngx.HTTP_PUT,
+                [[{
+                    "plugins": {
+                        "response-rewrite": {
+                            "body": "hello"
+                        }
+                    }
+                }]]
+            )
+            if code > 300 then
+                ngx.log(ngx.ERR, body)
+                ngx.status = code
+                ngx.say("Failed to create consumer group")
+                return
+            end
+
+            -- Then, create a consumer with this group_id
+            local code2, body2 = t('/apisix/admin/consumers',
+                ngx.HTTP_PUT,
+                [[{
+                    "username": "consumer_with_group",
+                    "group_id": "my_group"
+                }]]
+            )
+
+            ngx.status = code2
+            ngx.say("Consumer with valid group_id result: ", body2)
+
+            -- Cleanup
+            t('/apisix/admin/consumers/consumer_with_group', ngx.HTTP_DELETE)
+            t('/apisix/admin/consumer_groups/my_group', ngx.HTTP_DELETE)
+        }
+    }
+--- request
+GET /t
+--- error_code: 201
+
+
+=== TEST 13: add consumer with non-existent group_id (should fail)
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+
+            -- Try to create a consumer with non-existent group_id
+            local code, body = t('/apisix/admin/consumers',
+                ngx.HTTP_PUT,
+                [[{
+                    "username": "consumer_with_invalid_group",
+                    "group_id": "non_existent_group"
+                }]]
+            )
+
+            ngx.status = code
+            ngx.say("Consumer with invalid group_id result: ", body)
+        }
+    }
+--- request
+GET /t
+--- error_code: 400
+--- response_body_like: failed to fetch consumer group info by consumer group id \[non_existent_group\]
+
+
+=== TEST 14: update consumer to add/change group_id
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+
+            -- First, create consumer without group
+            local code, body = t('/apisix/admin/consumers',
+                ngx.HTTP_PUT,
+                [[{
+                    "username": "consumer_update_group"
+                }]]
+            )
+            if code > 300 then
+                ngx.say("Failed to create initial consumer")
+                return
+            end
+
+            -- Create a consumer group
+            local code2, body2 = t('/apisix/admin/consumer_groups/update_test_group',
+                ngx.HTTP_PUT,
+                [[{
+                    "plugins": {}
+                }]]
+            )
+
+            -- Update consumer with group_id
+            local code3, body3 = t('/apisix/admin/consumers',
+                ngx.HTTP_PUT,
+                [[{
+                    "username": "consumer_update_group",
+                    "group_id": "update_test_group"
+                }]]
+            )
+
+            ngx.status = code3
+            ngx.say("Update consumer with group_id result: ", code3)
+
+            -- Cleanup
+            t('/apisix/admin/consumers/consumer_update_group', ngx.HTTP_DELETE)
+            t('/apisix/admin/consumer_groups/update_test_group', ngx.HTTP_DELETE)
+        }
+    }
+--- request
+GET /t
+--- error_code: 200
