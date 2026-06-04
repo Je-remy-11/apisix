@@ -68,132 +68,297 @@ for dir in pairs(constants.STREAM_ETCD_DIRECTORY) do
 end
 
 
-local function check_duplicate(item, key, id_set)
-    local identifier, identifier_type
-    if key == "consumers" then
-        identifier = item.id or item.username
-        identifier_type = item.id and "credential id" or "username"
-    else
-        identifier = item.id
-        identifier_type = "id"
-    end
+--- Resource Handlers (Strategy Pattern)
+local ResourceHandlers = {}
 
-    if not identifier then
-        return false
-    end
 
-    if id_set[identifier] then
-        return true, "found duplicate " .. identifier_type .. " " .. identifier .. " in " .. key
-    end
-    id_set[identifier] = true
-    return false
+--- Default Resource Handler
+local DefaultHandler = {}
+DefaultHandler.__index = DefaultHandler
+
+function DefaultHandler.new()
+    local self = setmetatable({}, DefaultHandler)
+    return self
 end
 
+function DefaultHandler:get_identifier(item)
+    return item.id, "id"
+end
 
-local function check_conf(checker, schema, item, typ)
+function DefaultHandler:extract_check_options(item, resource_type)
+    return { skip_references_check = true }
+end
+
+function DefaultHandler:check_conf(checker, schema, item, resource_type)
     if not checker then
         return true
     end
-    local str_id = tostring(item.id)
-    if typ == "consumers" and
-        core.string.find(str_id, "/credentials/") then
+    local options = self:extract_check_options(item, resource_type)
+    return checker(item.id, item, false, schema, options)
+end
+
+
+--- Consumers Resource Handler
+local ConsumersHandler = setmetatable({}, { __index = DefaultHandler })
+ConsumersHandler.__index = ConsumersHandler
+
+function ConsumersHandler.new()
+    local self = setmetatable(DefaultHandler.new(), ConsumersHandler)
+    return self
+end
+
+function ConsumersHandler:get_identifier(item)
+    if item.id then
+        return item.id, "credential id"
+    end
+    if item.username then
+        return item.username, "username"
+    end
+    return nil, nil
+end
+
+function ConsumersHandler:check_conf(checker, schema, item, resource_type)
+    if not checker then
+        return true
+    end
+    local str_id = tostring(item.id or "")
+    if core.string.find(str_id, "/credentials/") then
         local credential_checker = resources.credentials.checker
         local credential_schema = resources.credentials.schema
         return credential_checker(item.id, item, false, credential_schema, {
             skip_references_check = true,
         })
     end
-
-    local secret_type
-    if typ == "secrets" then
-        local idx = str_find(str_id or "", "/")
-        if not idx then
-            return false, {
-                error_msg = "invalid secret id: " .. (str_id or "")
-            }
-        end
-        secret_type = str_sub(str_id, 1, idx - 1)
-    end
-    return checker(item.id, item, false, schema, {
-        secret_type = secret_type,
-        skip_references_check = true,
-    })
+    return DefaultHandler.check_conf(self, checker, schema, item, resource_type)
 end
 
 
+--- Secrets Resource Handler
+local SecretsHandler = setmetatable({}, { __index = DefaultHandler })
+SecretsHandler.__index = SecretsHandler
+
+function SecretsHandler.new()
+    local self = setmetatable(DefaultHandler.new(), SecretsHandler)
+    return self
+end
+
+function SecretsHandler:extract_check_options(item, resource_type)
+    local options = { skip_references_check = true }
+    local str_id = tostring(item.id or "")
+    local idx = str_find(str_id, "/")
+    if not idx then
+        options._invalid_secret = true
+        return options
+    end
+    options.secret_type = str_sub(str_id, 1, idx - 1)
+    return options
+end
+
+function SecretsHandler:check_conf(checker, schema, item, resource_type)
+    if not checker then
+        return true
+    end
+    local options = self:extract_check_options(item, resource_type)
+    if options._invalid_secret then
+        return false, {
+            error_msg = "invalid secret id: " .. (tostring(item.id) or "")
+        }
+    end
+    return checker(item.id, item, false, schema, options)
+end
+
+
+--- Register Resource Handlers
+ResourceHandlers["consumers"] = ConsumersHandler.new()
+ResourceHandlers["secrets"] = SecretsHandler.new()
+
+
+local function get_resource_handler(resource_type)
+    return ResourceHandlers[resource_type] or DefaultHandler.new()
+end
+
+
+--- Duplicate Detector Module
+local DuplicateDetector = {}
+DuplicateDetector.__index = DuplicateDetector
+
+function DuplicateDetector.new()
+    local self = setmetatable({}, DuplicateDetector)
+    self.id_sets = {}
+    return self
+end
+
+function DuplicateDetector:check_duplicate(resource_type, item)
+    local handler = get_resource_handler(resource_type)
+    local identifier, identifier_type = handler:get_identifier(item)
+    
+    if not identifier then
+        return false
+    end
+    
+    if not self.id_sets[resource_type] then
+        self.id_sets[resource_type] = {}
+    end
+    
+    local id_set = self.id_sets[resource_type]
+    if id_set[identifier] then
+        return true, "found duplicate " .. identifier_type .. " " .. identifier .. " in " .. resource_type
+    end
+    id_set[identifier] = true
+    return false
+end
+
+
+--- Error Collector Module
+local ErrorCollector = {}
+ErrorCollector.__index = ErrorCollector
+
+function ErrorCollector.new(collect_all_errors)
+    local self = setmetatable({}, ErrorCollector)
+    self.collect_all = collect_all_errors
+    self.results = {}
+    self.is_valid = true
+    return self
+end
+
+function ErrorCollector:add_error(resource_type, resource_id, index, error_msg)
+    self.is_valid = false
+    if self.collect_all then
+        table_insert(self.results, {
+            resource_type = resource_type,
+            resource_id = resource_id,
+            index = index,
+            error = error_msg
+        })
+        return false, nil
+    else
+        return false, error_msg
+    end
+end
+
+function ErrorCollector:add_conf_version_error(conf_version_key, got_type)
+    self.is_valid = false
+    if self.collect_all then
+        table_insert(self.results, {
+            resource_type = str_sub(conf_version_key, 1, -#CONF_VERSION_KEY_SUFFIX - 1),
+            error = conf_version_key .. " must be a number, got " .. got_type
+        })
+        return false, nil
+    else
+        return false, conf_version_key .. " must be a number"
+    end
+end
+
+function ErrorCollector:get_results()
+    if self.collect_all then
+        return self.is_valid, self.results
+    end
+    return self.is_valid, nil
+end
+
+
+--- Validator Module
+local Validator = {}
+Validator.__index = Validator
+
+function Validator.new(req_body, collect_all_errors)
+    local self = setmetatable({}, Validator)
+    self.req_body = req_body
+    self.error_collector = ErrorCollector.new(collect_all_errors)
+    self.duplicate_detector = DuplicateDetector.new()
+    return self
+end
+
+function Validator:validate_conf_version(resource_type, conf_version_key)
+    local new_conf_version = self.req_body[conf_version_key]
+    if new_conf_version and type(new_conf_version) ~= "number" then
+        return self.error_collector:add_conf_version_error(conf_version_key, type(new_conf_version))
+    end
+    return true
+end
+
+function Validator:validate_item(resource_type, item, index)
+    local resource = resources[resource_type] or {}
+    local item_schema = resource.schema
+    local item_checker = resource.checker
+    local handler = get_resource_handler(resource_type)
+    
+    local item_temp = tbl_deepcopy(item)
+    local ok, valid, err = pcall(function()
+        return handler:check_conf(item_checker, item_schema, item_temp, resource_type)
+    end)
+    
+    if not ok then
+        err = valid
+        valid = false
+    end
+    
+    if not valid then
+        local err_msg = type(err) == "table" and err.error_msg or tostring(err)
+        local identifier, _ = handler:get_identifier(item)
+        local resource_id = identifier or ""
+        return self.error_collector:add_error(resource_type, resource_id, index - 1, err_msg)
+    end
+    
+    return true
+end
+
+function Validator:validate_duplicate(resource_type, item, index)
+    local duplicated, dup_err = self.duplicate_detector:check_duplicate(resource_type, item)
+    if duplicated then
+        local handler = get_resource_handler(resource_type)
+        local identifier, _ = handler:get_identifier(item)
+        local resource_id = identifier or ""
+        return self.error_collector:add_error(resource_type, resource_id, index - 1, dup_err)
+    end
+    return true
+end
+
+function Validator:validate_resource(resource_type, conf_version_key)
+    if not self:validate_conf_version(resource_type, conf_version_key) then
+        if not self.error_collector.collect_all then
+            return false
+        end
+    end
+    
+    local items = self.req_body[resource_type]
+    if not items or #items <= 0 then
+        return true
+    end
+    
+    for index, item in ipairs(items) do
+        if not self:validate_item(resource_type, item, index) then
+            if not self.error_collector.collect_all then
+                return false
+            end
+        end
+        
+        if not self:validate_duplicate(resource_type, item, index) then
+            if not self.error_collector.collect_all then
+                return false
+            end
+        end
+    end
+    
+    return true
+end
+
+function Validator:validate_all()
+    for resource_type, conf_version_key in pairs(ALL_RESOURCE_KEYS) do
+        if not self:validate_resource(resource_type, conf_version_key) then
+            if not self.error_collector.collect_all then
+                break
+            end
+        end
+    end
+    return self.error_collector:get_results()
+end
+
+
+--- Main validation function
 function _M.validate_configuration(req_body, collect_all_errors)
-    local is_valid = true
-    local validation_results = {}
-
-    for key, conf_version_key in pairs(ALL_RESOURCE_KEYS) do
-        local items = req_body[key]
-        local resource = resources[key] or {}
-
-        -- Validate conf_version_key if present
-        local new_conf_version = req_body[conf_version_key]
-        if new_conf_version and type(new_conf_version) ~= "number" then
-            if not collect_all_errors then
-                return false, conf_version_key .. " must be a number"
-            end
-            is_valid = false
-            table_insert(validation_results, {
-                resource_type = key,
-                error = conf_version_key .. " must be a number, got " .. type(new_conf_version)
-            })
-        end
-
-        if items and #items > 0 then
-            local item_schema = resource.schema
-            local item_checker = resource.checker
-            local id_set = {}
-
-            for index, item in ipairs(items) do
-                local item_temp = tbl_deepcopy(item)
-                local ok, valid, err = pcall(check_conf, item_checker, item_schema, item_temp, key)
-                if not ok then
-                    -- checker threw an error
-                    err = valid  -- pcall returns (false, error_message)
-                    valid = false
-                end
-                if not valid then
-                    local err_msg = type(err) == "table" and err.error_msg or tostring(err)
-                    local resource_id = item.id or item.username or ""
-
-                    if not collect_all_errors then
-                        return false, err_msg
-                    end
-                    is_valid = false
-                    table_insert(validation_results, {
-                        resource_type = key,
-                        resource_id = resource_id,
-                        index = index - 1,
-                        error = err_msg
-                    })
-                end
-
-                -- check for duplicate IDs
-                local duplicated, dup_err = check_duplicate(item, key, id_set)
-                if duplicated then
-                    if not collect_all_errors then
-                        return false, dup_err
-                    end
-                    is_valid = false
-                    table_insert(validation_results, {
-                        resource_type = key,
-                        resource_id = item.id or item.username or "",
-                        index = index - 1,
-                        error = dup_err
-                    })
-                end
-            end
-        end
-    end
-
-    if collect_all_errors then
-        return is_valid, validation_results
-    end
-
-    return is_valid, nil
+    local validator = Validator.new(req_body, collect_all_errors)
+    return validator:validate_all()
 end
 
 
@@ -257,6 +422,11 @@ end
 
 function _M.get_resources()
     return resources
+end
+
+
+function _M.get_resource_handler(resource_type)
+    return get_resource_handler(resource_type)
 end
 
 
