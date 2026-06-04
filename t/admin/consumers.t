@@ -360,3 +360,98 @@ GET /t
 --- error_code: 400
 --- response_body eval
 qr/\{"error_msg":"the property is forbidden:.*"\}/
+
+
+
+=== TEST 12: patch consumer with partial body
+--- config
+    location /t {
+        content_by_lua_block {
+            local t = require("lib.test_admin").test
+            local etcd = require("apisix.core.etcd")
+
+            local code, body = t('/apisix/admin/consumers',
+                ngx.HTTP_PUT,
+                [[{
+                    "username": "patch-jack",
+                    "desc": "before patch",
+                    "plugins": {
+                        "key-auth": {
+                            "key": "auth-one"
+                        }
+                    }
+                }]]
+            )
+            if code >= 300 then
+                ngx.status = code
+                ngx.say(body)
+                return
+            end
+
+            local res = assert(etcd.get('/consumers/patch-jack'))
+            local prev_create_time = res.body.node.value.create_time
+            local prev_update_time = res.body.node.value.update_time
+            assert(prev_create_time ~= nil, "create_time is nil")
+            assert(prev_update_time ~= nil, "update_time is nil")
+            ngx.sleep(1)
+
+            local code, body = t('/apisix/admin/consumers/patch-jack',
+                ngx.HTTP_PATCH,
+                [[{
+                    "labels": {
+                        "env": "production"
+                    }
+                }]],
+                [[{
+                    "value": {
+                        "username": "patch-jack",
+                        "desc": "before patch",
+                        "labels": {
+                            "env": "production"
+                        }
+                    },
+                    "key": "/apisix/consumers/patch-jack"
+                }]]
+            )
+
+            if code >= 300 then
+                ngx.status = code
+                ngx.say(body)
+                return
+            end
+
+            local code, body = t('/apisix/admin/consumers/patch-jack',
+                ngx.HTTP_GET,
+                nil,
+                [[{
+                    "value": {
+                        "username": "patch-jack",
+                        "desc": "before patch",
+                        "labels": {
+                            "env": "production"
+                        },
+                        "plugins": {
+                            "key-auth": {
+                                "key": "auth-one"
+                            }
+                        }
+                    },
+                    "key": "/apisix/consumers/patch-jack"
+                }]]
+            )
+
+            ngx.status = code
+            ngx.say(body)
+
+            local res = assert(etcd.get('/consumers/patch-jack'))
+            local create_time = res.body.node.value.create_time
+            local update_time = res.body.node.value.update_time
+            assert(prev_create_time == create_time, "create_time mismatched")
+            assert(update_time ~= nil, "update_time is nil")
+            assert(prev_update_time ~= update_time, "update_time should be changed")
+        }
+    }
+--- request
+GET /t
+--- response_body
+passed
