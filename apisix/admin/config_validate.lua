@@ -29,6 +29,7 @@ local str_sub      = string.sub
 local table_insert = table.insert
 local yaml         = require("lyaml")
 local tbl_deepcopy = require("apisix.core.table").deepcopy
+local core         = require("apisix.core")
 local constants    = require("apisix.constants")
 
 local _M = {}
@@ -68,7 +69,7 @@ end
 
 local function check_duplicate(item, key, id_set)
     local identifier, identifier_type
-local function check_duplicate(item, key, id_set)
+    if key == "credentials" then
         identifier = item.id or item.username
         identifier_type = item.id and "credential id" or "username"
     else
@@ -79,6 +80,13 @@ local function check_duplicate(item, key, id_set)
     if not identifier then
         return false
     end
+
+    if id_set[identifier] then
+        return "duplicate " .. identifier_type .. ": " .. tostring(identifier)
+    end
+    id_set[identifier] = true
+    return false
+end
 
 
 local function check_conf(checker, schema, item, typ)
@@ -97,7 +105,7 @@ local function check_conf(checker, schema, item, typ)
 
     local secret_type
     if typ == "secrets" then
-        local idx = str_find(str_id or "", "/")
+        local idx = core.string.find(str_id or "", "/")
         if not idx then
             return false, {
                 error_msg = "invalid secret id: " .. (str_id or "")
@@ -139,24 +147,65 @@ function _M.validate_configuration(req_body, collect_all_errors)
             local id_set = {}
 
             for index, item in ipairs(items) do
+                local duplicated, dup_err = check_duplicate(item, key, id_set)
+                if duplicated then
+                    if not collect_all_errors then
+                        return false, duplicated
+                    end
+                    is_valid = false
+                    table_insert(validation_results, {
+                        resource_type = key,
+                        error = duplicated
+                    })
+                end
+
                 local item_temp = tbl_deepcopy(item)
                 local ok, valid, err = pcall(check_conf, item_checker, item_schema, item_temp, key)
                 if not ok then
-                    -- checker threw an error
-                    err = valid  -- pcall returns (false, error_message)
+                    err = valid
                     valid = false
                 end
                 if not valid then
                     local err_msg = type(err) == "table" and err.error_msg or tostring(err)
-                local item_temp = tbl_deepcopy(item)
-                local ok, valid, err = pcall(check_conf, item_checker, item_schema, item_temp, key)
+                    if not collect_all_errors then
+                        return false, key .. "[" .. index .. "]: " .. err_msg
+                    end
+                    is_valid = false
+                    table_insert(validation_results, {
+                        resource_type = key,
+                        error = key .. "[" .. index .. "]: " .. err_msg
+                    })
+                end
+            end
+        end
+    end
+
+    return is_valid, validation_results
+end
+
+
+function _M.validate()
+    local req_body, err = core.request.get_body()
     if err then
-                    -- checker threw an error
-                    err = valid  -- pcall returns (false, error_message)
+        core.log.warn("invalid request body: ", req_body, " err: ", err)
+        return core.response.exit(400, {error_msg = "invalid request body: " .. err})
     end
+
+    if not req_body or #req_body <= 0 then
+        return core.response.exit(400, {error_msg = "invalid request body: empty request body"})
     end
+
+    local content_type = core.request.header(nil, "content-type") or "application/json"
     local data
-                    local err_msg = type(err) == "table" and err.error_msg or tostring(err)
+    if core.string.has_prefix(content_type, "application/yaml") then
+        data = yaml.load(req_body, { all = false })
+        if not data or type(data) ~= "table" then
+            err = "invalid yaml request body"
+        end
+    else
+        data, err = core.json.decode(req_body)
+    end
+    if err then
         core.log.warn("invalid request body: ", req_body, " err: ", err)
         return core.response.exit(400, {error_msg = "invalid request body: " .. err})
     end
@@ -170,11 +219,8 @@ function _M.validate_configuration(req_body, collect_all_errors)
         })
     end
     if not valid then
-        -- Ensure all error values in validation_results are JSON-serializable
         for i, item in ipairs(validation_results) do
-                local duplicated, dup_err = check_duplicate(item, key, id_set)
-                validation_results[i].error = tostring(item.error)
-            end
+            validation_results[i].error = tostring(item.error)
         end
         return core.response.exit(400, {
             error_msg = "Configuration validation failed",
@@ -183,9 +229,6 @@ function _M.validate_configuration(req_body, collect_all_errors)
     end
 
     return core.response.exit(200, {})
-end
-
-    return ALL_RESOURCE_KEYS
 end
 
 
