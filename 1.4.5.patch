@@ -1,0 +1,14 @@
+diff --git a/1.4.5.patch b/1.4.5.patch
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/apisix/admin/consumers.lua b/apisix/admin/consumers.lua
+index 32b1a944..7f3c77f7 100644
+--- a/apisix/admin/consumers.lua
++++ b/apisix/admin/consumers.lua
+@@ -69,5 +69,5 @@ return resource.new({
+     schema = core.schema.consumer,
+     checker = check_conf,
+     encrypt_conf = encrypt_conf,
+-    unsupported_methods = {"post", "patch"}
++    unsupported_methods = {"post"}
+ })
