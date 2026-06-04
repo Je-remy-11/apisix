@@ -14,60 +14,51 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 --
-local core    = require("apisix.core")
-local plugins = require("apisix.admin.plugins")
-local plugins_encrypt_conf = require("apisix.admin.plugins").encrypt_conf
-local resource = require("apisix.admin.resource")
+local core = require("apisix.core")
+local resource_codegen = require("apisix.admin.resource_codegen")
 
 
-local function check_conf(username, conf, need_username, schema, opts)
-    opts = opts or {}
-    local ok, err = core.schema.check(schema, conf)
-    if not ok then
-        return nil, {error_msg = "invalid configuration: " .. err}
-    end
-
-    if username and username ~= conf.username then
-        return nil, {error_msg = "wrong username" }
-    end
-
-    if conf.plugins then
-        ok, err = plugins.check_schema(conf.plugins, core.schema.TYPE_CONSUMER)
-        if not ok then
-            return nil, {error_msg = "invalid plugins configuration: " .. err}
-        end
-    end
-
-    if conf.group_id and not opts.skip_references_check then
-        local key = "/consumer_groups/" .. conf.group_id
-        local res, err = core.etcd.get(key)
-        if not res then
-            return nil, {error_msg = "failed to fetch consumer group info by "
-                                     .. "consumer group id [" .. conf.group_id .. "]: "
-                                     .. err}
-        end
-
-        if res.status ~= 200 then
-            return nil, {error_msg = "failed to fetch consumer group info by "
-                                     .. "consumer group id [" .. conf.group_id .. "], "
-                                     .. "response code: " .. res.status}
-        end
-    end
-
-    return conf.username
-end
-
-
-local function encrypt_conf(id, conf)
-    plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
-end
-
-
-return resource.new({
+return resource_codegen.new({
     name = "consumers",
     kind = "consumer",
     schema = core.schema.consumer,
-    checker = check_conf,
-    encrypt_conf = encrypt_conf,
-    unsupported_methods = {"post", "patch"}
+    checker = {
+        steps = {
+            {
+                use = "schema",
+            },
+            {
+                use = "id_matches_field",
+                field = "username",
+                error_msg = "wrong username",
+            },
+            {
+                use = "plugins_schema",
+                field = "plugins",
+                schema_type = core.schema.TYPE_CONSUMER,
+            },
+            {
+                use = "reference_exists",
+                field = "group_id",
+                key = "/consumer_groups/${value}",
+                skip_option = "skip_references_check",
+                fetch_error = "failed to fetch consumer group info by consumer group id [${value}]: ${err}",
+                status_error = "failed to fetch consumer group info by consumer group id [${value}], response code: ${status}",
+            },
+        },
+        success = {
+            use = "field",
+            field = "username",
+        },
+    },
+    encrypt_conf = {
+        steps = {
+            {
+                use = "plugins_encrypt",
+                field = "plugins",
+                schema_type = core.schema.TYPE_CONSUMER,
+            },
+        },
+    },
+    unsupported_methods = {"post", "patch"},
 })
