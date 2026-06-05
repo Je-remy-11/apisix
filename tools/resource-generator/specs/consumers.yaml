@@ -1,0 +1,43 @@
+# APISIX Admin Resource Spec: consumers
+# =======================================
+# Demonstrates:
+#   1. no_id=true (consumers use username as identity, not numeric ID)
+#   2. unsupported_methods = ["post", "patch"]
+#   3. Custom username_match validation (id must equal conf.username)
+#   4. etcd_ref for group_id with consumer_group reference check
+#   5. plugins_check_consumer (plugin validation with TYPE_CONSUMER)
+
+name: consumers
+kind: consumer
+schema: core.schema.consumer
+no_id: true
+
+# ---- Route-level options
+# Consumers don't support POST (must use PUT with username as key)
+# and don't support PATCH
+unsupported_methods:
+  - post
+  - patch
+
+# ---- Encryption
+encrypt:
+  plugins: true
+
+# ---- check_conf validation steps
+validations:
+  # 1. JSON Schema validation
+  - type: schema_check
+
+  # 2. Enforce id == conf.username (custom logic: the resource ID must match
+  #    the `username` field in the config body)
+  - type: username_match
+
+  # 3. Validate plugin schemas with consumer-specific TYPE_CONSUMER
+  - type: plugins_check_consumer
+
+  # 4. Reference check: verify group_id points to an existing consumer_group
+  #    (equivalent to the handwritten code in consumers.lua)
+  - type: etcd_ref
+    field: group_id
+    prefix: "/consumer_groups/"
+    label: consumer group info

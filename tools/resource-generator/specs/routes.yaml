@@ -1,0 +1,160 @@
+# APISIX Admin Resource Spec: routes
+# ====================================
+# This YAML spec describes the "routes" admin resource.
+# The generator reads this and produces apisix/admin/routes.lua
+#
+# DSL Format Specification:
+# -------------------------
+# name:          (required) etcd directory name, maps to resource.new({name=...})
+# kind:          (required) human-readable kind, maps to resource.new({kind=...})
+# schema:        (required) the schema reference string
+# no_id:         (optional) true for resources without numeric ID (consumers, plugin_metadata)
+# unsupported_methods: (optional) list of HTTP methods to disable
+# list_filter_fields: (optional) map of fields usable for list filtering
+#
+# imports:       (optional) list of extra require statements as raw Lua strings
+#
+# encrypt:       (optional) encryption configuration
+#   upstream:    true to auto-encrypt conf.upstream
+#   plugins:     true to auto-encrypt conf.plugins
+#   custom:      raw Lua code for custom encryption logic
+#
+# validations:   (required) ordered list of validation steps for check_conf()
+#   Each step supports one of the following types:
+#
+#   Built-in types:
+#   - schema_check       : core.schema.check(schema, conf) — always first
+#   - assert_not_both    : reject if two mutually-exclusive fields coexist
+#   - delegate           : call external checker function
+#   - etcd_ref           : verify a referenced resource exists in etcd
+#   - plugins_check      : validate plugin schemas via schema_plugin()
+#   - inline             : embed raw Lua code
+#
+#   Domain-specific types:
+#   - plugins_check_consumer  : validate plugins with TYPE_CONSUMER
+#   - username_match          : enforce id == conf.username
+#   - etcd_protocol_ref       : verify stream_route protocol parent
+#   - stream_route_checker    : call stream_route_checker()
+#   - ssl_check               : call apisix_ssl.check_ssl_conf()
+#   - secrets_check           : dynamic schema loading for secrets
+#   - global_rule_plugin_conflict : prevent duplicate plugins across rules
+#   - credentials_auth_check  : only auth-type plugins allowed
+#   - proto_compile_check     : validate protobuf content
+#   - plugin_metadata_check   : dynamic plugin metadata schema validation
+#
+# delete_checker: (optional) pre-deletion reference checks
+#   Each entry supports:
+#   - type: "route_ref" — scans a resource list for field references
+#     getter:    Lua expression to fetch the resource list
+#     ref_field: field name on the resource to compare against id
+#     label:     human-readable label for error messages
+#     error_tpl: error template (use {} for the matched resource id)
+#
+#   - type: "inline" — raw Lua code
+#
+# local_stanzas:    (optional) raw Lua code blocks inserted before check_conf
+# custom_functions: (optional) raw Lua function definitions inserted before return
+
+name: routes
+kind: route
+schema: core.schema.route
+
+# ---- Route-level options
+unsupported_methods: []
+list_filter_fields:
+  service_id: true
+  upstream_id: true
+
+# ---- Extra requires
+imports:
+  - "local expr = require(\"resty.expr.v1\")"
+  - "local jp = require(\"jsonpath\")"
+
+# ---- Encryption: what to encrypt on write
+encrypt:
+  upstream: true
+  plugins: true
+
+# ---- check_conf validation steps (executed in order)
+validations:
+  # 1. JSON Schema validation (always the first step)
+  - type: schema_check
+
+  # 2. Mutual exclusion checks
+  - type: assert_not_both
+    fields: ["host", "hosts"]
+    msg: "only one of host or hosts is allowed"
+
+  - type: assert_not_both
+    fields: ["remote_addr", "remote_addrs"]
+    msg: "only one of remote_addr or remote_addrs is allowed"
+
+  # 3. Upstream configuration validation
+  - type: delegate
+    condition: "conf.upstream"
+    checker: "apisix_upstream.check_upstream_conf"
+    arg: "upstream_val"
+
+  # 4. etcd reference checks (verify IDs point to existing resources)
+  - type: etcd_ref
+    field: upstream_id
+    prefix: "/upstreams/"
+    label: upstream
+
+  - type: etcd_ref
+    field: service_id
+    prefix: "/services/"
+    label: service info
+
+  - type: etcd_ref
+    field: plugin_config_id
+    prefix: "/plugin_configs/"
+    label: plugin config
+
+  # 5. Plugin schema validation
+  - type: plugins_check
+
+  # 6. Inline Lua for custom validation logic
+  - type: inline
+    condition: "conf.vars"
+    code: |
+      local ok, err = expr.new(conf.vars)
+      if not ok then
+        return nil, {error_msg = "failed to validate the 'vars' expression: " .. err}
+      end
+
+  - type: inline
+    condition: "conf.filter_func"
+    code: |
+      local func, err = loadstring("return " .. conf.filter_func)
+      if not func then
+        return nil, {error_msg = "failed to load 'filter_func' string: " .. err}
+      end
+      if type(func()) ~= "function" then
+        return nil, {error_msg = "'filter_func' should be a function"}
+      end
+
+  - type: inline
+    condition: "conf.script"
+    code: |
+      local obj, err = loadstring(conf.script)
+      if not obj then
+        return nil, {error_msg = "failed to load 'script' string: " .. err}
+      end
+      if type(obj()) ~= "table" then
+        return nil, {error_msg = "'script' should be a Lua object"}
+      end
+
+# ---- Pre-deletion reference checks
+delete_checker:
+  - type: route_ref
+    getter: "get_routes()"
+    ref_field: service_id
+    label: route
+    error_tpl: "can not delete this service directly, route [{}] is still using it now"
+
+  - type: route_ref
+    getter: "get_stream_routes()"
+    ref_field: service_id
+    label: stream_route
+    error_tpl: "can not delete this service directly, stream_route [{}] is still using it now"
