@@ -25,7 +25,6 @@ local plugin_get_all = require("apisix.plugin").get_all
 local plugin_get_http = require("apisix.plugin").get
 local plugin_get_stream = require("apisix.plugin").get_stream
 local encrypt_conf = require("apisix.plugin").encrypt_conf
-local pairs = pairs
 
 local _M = {}
 
@@ -40,15 +39,6 @@ function _M.encrypt_conf(plugins_conf, schema_type)
         for name, conf in pairs(plugins_conf) do
             encrypt_conf(name, conf, schema_type)
         end
-    end
-end
-
-
-function _M.get(name)
-    local arg = get_uri_args()
-    -- If subsystem is passed inside args then it should be oneOf: http / stream.
-    local subsystem = arg["subsystem"] or "http"
-    if subsystem ~= "http" and subsystem ~= "stream" then
         return 400, {error_msg = "unsupported subsystem: "..subsystem}
     end
 

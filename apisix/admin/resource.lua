@@ -421,12 +421,6 @@ function _M:patch(id, conf, sub_path, args)
     local node_value = res_old.body.node.value
     local modified_index = res_old.body.node.modifiedIndex
 
-    if sub_path and sub_path ~= "" then
-        if self.name == "ssls" then
-            if sub_path == "key" then
-                conf = apisix_ssl.aes_encrypt_pkey(conf)
-            elseif sub_path == "keys" then
-                for i = 1, #conf do
                     conf[i] = apisix_ssl.aes_encrypt_pkey(conf[i])
                 end
             end
