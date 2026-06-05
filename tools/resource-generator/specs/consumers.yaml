@@ -1,0 +1,175 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# ============================================================================
+# APISIX Admin Resource Specification (YAML DSL)
+# ============================================================================
+# This file defines the input format for the resource code generator.
+# A single YAML spec describes everything needed to generate a complete
+# admin resource module (e.g. consumers.lua, routes.lua, upstreams.lua).
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# 1. Basic metadata
+# ---------------------------------------------------------------------------
+resource:
+  # The etcd key prefix (also used as the module name), e.g. "consumers"
+  name: "consumers"
+  # Human-readable singular name for error messages, e.g. "consumer"
+  kind: "consumer"
+
+# ---------------------------------------------------------------------------
+# 2. Schema reference
+# ---------------------------------------------------------------------------
+# Points to the JSON Schema definition in core.schema.*
+# The generator emits:  schema = core.schema.<schema_name>
+schema: "consumer"
+
+# ---------------------------------------------------------------------------
+# 3. Route-level constraints
+# ---------------------------------------------------------------------------
+# HTTP methods that should NOT be registered for this resource.
+# Each entry causes the corresponding method handler to return 405.
+# Valid values: "get", "post", "put", "delete", "patch"
+unsupported_methods:
+  - "post"
+  - "patch"
+
+# ---------------------------------------------------------------------------
+# 4. Custom checker logic
+# ---------------------------------------------------------------------------
+# The checker function validates the incoming configuration beyond what
+# the JSON Schema can express. The generator supports two modes:
+#
+#   A) "builtin" — no custom checker needed; the generator emits a simple
+#      wrapper that calls core.schema.check and returns the id.
+#
+#   B) "custom" — the user provides a Lua code snippet that will be
+#      inlined as the check_conf function body. The snippet receives the
+#      same parameters as the original: (id, conf, need_id, schema, opts).
+#
+#   C) "composed" — the generator emits a checker that first runs the
+#      builtin schema check, then runs one or more "extra_checks".
+#
+# For mode B and C, the snippet is placed inside the function body.
+# The snippet should:
+#   - Return `nil, {error_msg = "..."}` on failure
+#   - Return `true` (or the id value) on success
+checker:
+  mode: "composed"
+
+  # Extra validation steps appended after the base schema check.
+  # Each step is a named block of Lua code.
+  extra_checks:
+    # --- username consistency check ---
+    # Ensures the URL path username (id) matches conf.username.
+    - name: "username_consistency"
+      code: |
+        if id and id ~= conf.username then
+            return nil, {error_msg = "wrong username" }
+        end
+
+    # --- plugins validation ---
+    # Validates consumer plugins using the admin plugin checker.
+    - name: "plugins_validation"
+      requires:
+        - module: "apisix.admin.plugins"
+          as: "admin_plugins"
+      code: |
+        if conf.plugins then
+            local ok, err = admin_plugins.check_schema(conf.plugins, core.schema.TYPE_CONSUMER)
+            if not ok then
+                return nil, {error_msg = "invalid plugins configuration: " .. err}
+            end
+        end
+
+    # --- group_id reference check ---
+    # Verifies that the referenced consumer_group actually exists in etcd.
+    - name: "group_id_reference"
+      code: |
+        if conf.group_id and not opts.skip_references_check then
+            local key = "/consumer_groups/" .. conf.group_id
+            local res, err = core.etcd.get(key)
+            if not res then
+                return nil, {error_msg = "failed to fetch consumer group info by "
+                                         .. "consumer group id [" .. conf.group_id .. "]: "
+                                         .. err}
+            end
+
+            if res.status ~= 200 then
+                return nil, {error_msg = "failed to fetch consumer group info by "
+                                         .. "consumer group id [" .. conf.group_id .. "], "
+                                         .. "response code: " .. res.status}
+            end
+        end
+
+  # Return value expression: what the checker function returns on success.
+  # Common values: "id", "true", "conf.username"
+  return_value: "conf.username"
+
+# ---------------------------------------------------------------------------
+# 5. Encryption hook
+# ---------------------------------------------------------------------------
+# If the resource stores sensitive fields (private keys, plugin configs),
+# define an encrypt_conf hook.
+#
+# Supported modes:
+#   "plugins"  — encrypt all plugin configs (the most common case)
+#   "custom"   — provide a custom Lua snippet
+encrypt_conf:
+  mode: "plugins"
+  # For mode "plugins", specify the schema type constant.
+  # Valid: "TYPE_CONSUMER", "TYPE_METADATA", or omit for default (TYPE_ROUTE).
+  schema_type: "TYPE_CONSUMER"
+
+# ---------------------------------------------------------------------------
+# 6. Delete checker
+# ---------------------------------------------------------------------------
+# Before deleting a resource, optionally verify that no other resources
+# reference it. The generator supports:
+#
+#   "builtin_reference" — check a specific resource type for references.
+#   "custom"            — provide a full Lua snippet.
+delete_checker:
+  mode: "builtin_reference"
+  # The resource to scan for references.
+  reference_resource: "consumers"
+  # The function to call to get the resource list.
+  # If omitted, defaults to calling <reference_resource>() from the
+  # corresponding module.
+  reference_field: "group_id"
+  # Error message template. {ref_kind} and {ref_id} are placeholders.
+  error_msg_template: "can not delete this consumer group, consumer [{ref_id}] is still using it now"
+
+# ---------------------------------------------------------------------------
+# 7. List filter fields
+# ---------------------------------------------------------------------------
+# Fields that can be used to filter list results via query parameters.
+# Optional; omit if not needed.
+# list_filter_fields:
+#   - "service_id"
+#   - "upstream_id"
+
+# ---------------------------------------------------------------------------
+# 8. Additional module imports
+# ---------------------------------------------------------------------------
+# Extra Lua modules to require at the top of the generated file.
+# Each entry: { module_path, local_name }
+extra_imports:
+  - module: "apisix.admin.plugins"
+    as: "plugins"
+  - module: "apisix.admin.plugins"
+    alias: "plugins_encrypt_conf"
+    member: "encrypt_conf"
