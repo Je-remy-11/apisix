@@ -1,0 +1,365 @@
+diff --git a/apisix/admin/consumers.lua b/apisix/admin/consumers.lua
+index 32b1a944..52fe218b 100644
+--- a/apisix/admin/consumers.lua
++++ b/apisix/admin/consumers.lua
+@@ -15,9 +15,13 @@
+ -- limitations under the License.
+ --
+ local core    = require("apisix.core")
++local plugin  = require("apisix.plugin")
+ local plugins = require("apisix.admin.plugins")
++local utils   = require("apisix.admin.utils")
+ local plugins_encrypt_conf = require("apisix.admin.plugins").encrypt_conf
+ local resource = require("apisix.admin.resource")
++local pairs   = pairs
++local type    = type
+ 
+ 
+ local function check_conf(username, conf, need_username, schema, opts)
+@@ -63,11 +67,85 @@ local function encrypt_conf(id, conf)
+ end
+ 
+ 
+-return resource.new({
++local function decrypt_consumer_plugins(conf)
++    if not conf or not conf.plugins then
++        return
++    end
++
++    for name, plugin_conf in pairs(conf.plugins) do
++        plugin.decrypt_conf(name, plugin_conf, core.schema.TYPE_CONSUMER)
++    end
++end
++
++
++local consumers = resource.new({
+     name = "consumers",
+     kind = "consumer",
+     schema = core.schema.consumer,
+     checker = check_conf,
+     encrypt_conf = encrypt_conf,
+-    unsupported_methods = {"post", "patch"}
++    unsupported_methods = {"post"}
+ })
++
++
++function consumers:patch(id, conf, sub_path, args)
++    if not id then
++        return 400, {error_msg = "missing " .. self.kind .. " id"}
++    end
++
++    if conf == nil then
++        return 400, {error_msg = "missing new configuration"}
++    end
++
++    if (not sub_path or sub_path == "") and type(conf) ~= "table" then
++        return 400, {error_msg = "invalid configuration"}
++    end
++
++    local key = "/" .. self.name .. "/" .. id
++    local res_old, err = core.etcd.get(key)
++    if not res_old then
++        core.log.error("failed to get ", self.kind, " [", key, "] in etcd: ", err)
++        return 503, {error_msg = err}
++    end
++
++    if res_old.status ~= 200 then
++        return res_old.status, res_old.body
++    end
++
++    local node_value = res_old.body.node.value
++    local modified_index = res_old.body.node.modifiedIndex
++    decrypt_consumer_plugins(node_value)
++
++    if sub_path and sub_path ~= "" then
++        local code, patch_err, node_val = core.table.patch(node_value, sub_path, conf)
++        node_value = node_val
++        if code then
++            return code, {error_msg = patch_err}
++        end
++        utils.inject_timestamp(node_value, nil, true)
++    else
++        node_value = core.table.merge(node_value, conf)
++        utils.inject_timestamp(node_value, nil, conf)
++    end
++
++    local ok, check_err = self:check_conf(id, node_value, true, nil, true)
++    if not ok then
++        return 400, check_err
++    end
++
++    local ttl = nil
++    if args then
++        ttl = args.ttl
++    end
++
++    local res, set_err = core.etcd.atomic_set(key, node_value, ttl, modified_index)
++    if not res then
++        core.log.error("failed to set new ", self.kind, "[", key, "] to etcd: ", set_err)
++        return 503, {error_msg = set_err}
++    end
++
++    return res.status, res.body
++end
++
++
++return consumers
+diff --git a/t/node/consumer-plugin3.t b/t/node/consumer-plugin3.t
+index 345bccd9..40338b69 100644
+--- a/t/node/consumer-plugin3.t
++++ b/t/node/consumer-plugin3.t
+@@ -61,7 +61,6 @@ apisix:
+ 
+             ngx.sleep(0.1)
+ 
+-            -- verify csrf key is decrypted in admin API
+             local code, message, res = t('/apisix/admin/consumers/jack',
+                 ngx.HTTP_GET
+             )
+@@ -73,7 +72,6 @@ apisix:
+             local consumer = json.decode(res)
+             ngx.say(consumer.value.plugins["csrf"].key)
+ 
+-            -- verify csrf key is encrypted in etcd
+             local etcd = require("apisix.core.etcd")
+             local res = assert(etcd.get('/consumers/jack'))
+             ngx.say(res.body.node.value.plugins["csrf"].key)
+@@ -157,3 +155,238 @@ Cookie: apisix-csrf-token=eyJyYW5kb20iOjAuNDI5ODYzMTk3MTYxMzksInNpZ24iOiI0ODRlMD
+ hello world
+ --- no_error_log
+ [error]
++
++
++
++=== TEST 5: patch consumer keeps encrypted fields stable
++--- yaml_config
++apisix:
++    data_encryption:
++        enable_encrypt_fields: true
++        keyring:
++            - edd1c9f0985e76a2
++--- config
++    location /t {
++        content_by_lua_block {
++            local t = require("lib.test_admin").test
++            local json = require("toolkit.json")
++            local etcd = require("apisix.core.etcd")
++
++            t('/apisix/admin/consumers/patch-jack', ngx.HTTP_DELETE)
++
++            local code, body = t('/apisix/admin/routes/11',
++                ngx.HTTP_PUT,
++                [[{
++                    "uri": "/patch-auth",
++                    "plugins": {
++                        "key-auth": {}
++                    },
++                    "upstream": {
++                        "nodes": {
++                            "127.0.0.1:1980": 1
++                        },
++                        "type": "roundrobin"
++                    }
++                }]]
++            )
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++
++            code, body = t('/apisix/admin/consumers',
++                ngx.HTTP_PUT,
++                [[{
++                    "username": "patch-jack",
++                    "desc": "before-patch",
++                    "plugins": {
++                        "key-auth": {
++                            "key": "patch-key"
++                        },
++                        "basic-auth": {
++                            "username": "patch-jack",
++                            "password": "patch-pass"
++                        }
++                    }
++                }]]
++            )
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++
++            ngx.sleep(0.1)
++
++            local res = assert(etcd.get('/consumers/patch-jack'))
++            local old_key = res.body.node.value.plugins["key-auth"].key
++            local old_password = res.body.node.value.plugins["basic-auth"].password
++
++            code, body = t('/apisix/admin/consumers/patch-jack',
++                ngx.HTTP_PATCH,
++                [[{
++                    "desc": "patched"
++                }]]
++            )
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++
++            ngx.sleep(0.1)
++
++            code, body, res = t('/apisix/admin/consumers/patch-jack', ngx.HTTP_GET)
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++
++            local consumer = json.decode(res)
++            ngx.say(consumer.value.desc)
++            ngx.say(consumer.value.plugins["key-auth"].key)
++            ngx.say(consumer.value.plugins["basic-auth"].password)
++
++            res = assert(etcd.get('/consumers/patch-jack'))
++            ngx.say(old_key == res.body.node.value.plugins["key-auth"].key)
++            ngx.say(old_password == res.body.node.value.plugins["basic-auth"].password)
++
++            code, _, body = t('/patch-auth', ngx.HTTP_GET, nil, nil, {
++                apikey = "patch-key"
++            })
++            ngx.status = code
++            ngx.say(body)
++        }
++    }
++--- request
++GET /t
++--- response_body
++patched
++patch-key
++patch-pass
++true
++true
++hello world
++--- no_error_log
++[error]
++
++
++
++=== TEST 6: patch consumer rewrites legacy ciphertext with current keyring head
++--- yaml_config
++apisix:
++    data_encryption:
++        enable_encrypt_fields: true
++        keyring:
++            - qeddd145sfvddff3
++            - edd1c9f0985e76a2
++--- config
++    location /t {
++        content_by_lua_block {
++            local aes = require("resty.aes")
++            local t = require("lib.test_admin").test
++            local json = require("toolkit.json")
++            local core = require("apisix.core")
++            local etcd = require("apisix.core.etcd")
++
++            local function encrypt_with_key(value, key)
++                local cipher = assert(aes:new(key, nil, aes.cipher(128, "cbc"), {iv = key}))
++                return ngx.encode_base64(assert(cipher:encrypt(value)))
++            end
++
++            local current_key = "qeddd145sfvddff3"
++            local previous_key = "edd1c9f0985e76a2"
++            local previous_encrypted_auth = encrypt_with_key("legacy-key", previous_key)
++            local previous_encrypted_password = encrypt_with_key("legacy-pass", previous_key)
++            local current_encrypted_auth = encrypt_with_key("legacy-key", current_key)
++            local current_encrypted_password = encrypt_with_key("legacy-pass", current_key)
++
++            t('/apisix/admin/consumers/patch-legacy', ngx.HTTP_DELETE)
++
++            local code, body = t('/apisix/admin/routes/12',
++                ngx.HTTP_PUT,
++                [[{
++                    "uri": "/legacy-patch-auth",
++                    "plugins": {
++                        "key-auth": {}
++                    },
++                    "upstream": {
++                        "nodes": {
++                            "127.0.0.1:1980": 1
++                        },
++                        "type": "roundrobin"
++                    }
++                }]]
++            )
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++
++            assert(core.etcd.set('/consumers/patch-legacy', {
++                username = 'patch-legacy',
++                desc = 'before-patch',
++                plugins = {
++                    ['key-auth'] = {
++                        key = previous_encrypted_auth
++                    },
++                    ['basic-auth'] = {
++                        username = 'patch-legacy',
++                        password = previous_encrypted_password
++                    }
++                }
++            }))
++
++            ngx.sleep(0.1)
++
++            code, body = t('/apisix/admin/consumers/patch-legacy',
++                ngx.HTTP_PATCH,
++                [[{
++                    "desc": "legacy-patched"
++                }]]
++            )
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++
++            ngx.sleep(0.1)
++
++            code, body, res = t('/apisix/admin/consumers/patch-legacy', ngx.HTTP_GET)
++            if code >= 300 then
++                ngx.status = code
++                ngx.say(body)
++                return
++            end
++
++            local consumer = json.decode(res)
++            ngx.say(consumer.value.desc)
++            ngx.say(consumer.value.plugins["key-auth"].key)
++            ngx.say(consumer.value.plugins["basic-auth"].password)
++
++            res = assert(etcd.get('/consumers/patch-legacy'))
++            ngx.say(res.body.node.value.plugins["key-auth"].key == current_encrypted_auth)
++            ngx.say(res.body.node.value.plugins["basic-auth"].password == current_encrypted_password)
++
++            code, _, body = t('/legacy-patch-auth', ngx.HTTP_GET, nil, nil, {
++                apikey = "legacy-key"
++            })
++            ngx.status = code
++            ngx.say(body)
++        }
++    }
++--- request
++GET /t
++--- response_body
++legacy-patched
++legacy-key
++legacy-pass
++true
++true
++hello world
++--- no_error_log
++[error]
