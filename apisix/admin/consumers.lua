@@ -16,18 +16,16 @@
 --
 local core    = require("apisix.core")
 local plugins = require("apisix.admin.plugins")
-local plugins_encrypt_conf = require("apisix.admin.plugins").encrypt_conf
 local resource = require("apisix.admin.resource")
 
 
-local function check_conf(username, conf, need_username, schema, opts)
-    opts = opts or {}
+local function check_conf(id, conf, need_id, schema, opts)
     local ok, err = core.schema.check(schema, conf)
     if not ok then
         return nil, {error_msg = "invalid configuration: " .. err}
     end
 
-    if username and username ~= conf.username then
+    if id and id ~= conf.username then
         return nil, {error_msg = "wrong username" }
     end
 
@@ -59,7 +57,12 @@ end
 
 
 local function encrypt_conf(id, conf)
-    plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
+    plugins.encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
+end
+
+
+local function decrypt_conf(id, conf)
+    plugins.decrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
 end
 
 
@@ -69,5 +72,6 @@ return resource.new({
     schema = core.schema.consumer,
     checker = check_conf,
     encrypt_conf = encrypt_conf,
-    unsupported_methods = {"post", "patch"}
+    decrypt_conf = decrypt_conf,
+    unsupported_methods = {"post"}
 })

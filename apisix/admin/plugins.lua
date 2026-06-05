@@ -25,6 +25,7 @@ local plugin_get_all = require("apisix.plugin").get_all
 local plugin_get_http = require("apisix.plugin").get
 local plugin_get_stream = require("apisix.plugin").get_stream
 local encrypt_conf = require("apisix.plugin").encrypt_conf
+local decrypt_conf = require("apisix.plugin").decrypt_conf
 local pairs = pairs
 
 local _M = {}
@@ -39,6 +40,15 @@ function _M.encrypt_conf(plugins_conf, schema_type)
     if plugins_conf then
         for name, conf in pairs(plugins_conf) do
             encrypt_conf(name, conf, schema_type)
+        end
+    end
+end
+
+
+function _M.decrypt_conf(plugins_conf, schema_type)
+    if plugins_conf then
+        for name, conf in pairs(plugins_conf) do
+            decrypt_conf(name, conf, schema_type)
         end
     end
 end

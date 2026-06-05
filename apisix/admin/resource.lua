@@ -421,6 +421,12 @@ function _M:patch(id, conf, sub_path, args)
     local node_value = res_old.body.node.value
     local modified_index = res_old.body.node.modifiedIndex
 
+    -- Decrypt old data from etcd before merging to prevent encrypt_conf
+    -- from double-encrypting fields that are already encrypted in etcd
+    if self.decrypt_conf then
+        self.decrypt_conf(id, node_value)
+    end
+
     if sub_path and sub_path ~= "" then
         if self.name == "ssls" then
             if sub_path == "key" then

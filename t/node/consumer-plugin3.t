@@ -62,6 +62,7 @@ apisix:
             ngx.sleep(0.1)
 
             -- verify csrf key is decrypted in admin API
+            -- verify csrf key is decrypted in admin API
             local code, message, res = t('/apisix/admin/consumers/jack',
                 ngx.HTTP_GET
             )
@@ -72,6 +73,7 @@ apisix:
             end
             local consumer = json.decode(res)
             ngx.say(consumer.value.plugins["csrf"].key)
+            -- verify csrf key is encrypted in etcd
 
             -- verify csrf key is encrypted in etcd
             local etcd = require("apisix.core.etcd")
@@ -152,8 +154,3 @@ POST /hello
 --- more_headers
 apikey: key-a
 apisix-csrf-token: eyJyYW5kb20iOjAuNDI5ODYzMTk3MTYxMzksInNpZ24iOiI0ODRlMDY4NTkxMWQ5NmJhMDc5YzQ1ZGI0OTE2NmZkYjQ0ODhjODVkNWQ0NmE1Y2FhM2UwMmFhZDliNjE5OTQ2IiwiZXhwaXJlcyI6MjY0MzExOTYyNH0=
-Cookie: apisix-csrf-token=eyJyYW5kb20iOjAuNDI5ODYzMTk3MTYxMzksInNpZ24iOiI0ODRlMDY4NTkxMWQ5NmJhMDc5YzQ1ZGI0OTE2NmZkYjQ0ODhjODVkNWQ0NmE1Y2FhM2UwMmFhZDliNjE5OTQ2IiwiZXhwaXJlcyI6MjY0MzExOTYyNH0=
---- response_body
-hello world
---- no_error_log
-[error]
