@@ -1,0 +1,1555 @@
+diff --git a/tools/resource-generator/README.md b/tools/resource-generator/README.md
+new file mode 100644
+index 00000000..206662ed
+--- /dev/null
++++ b/tools/resource-generator/README.md
+@@ -0,0 +1,351 @@
++# APISIX Admin Resource Code Generator
++
++## Overview
++
++A code generator for Apache APISIX admin resource modules. Instead of manually writing repetitive CRUD boilerplate for each resource (routes, services, upstreams, consumers, etc.), you define a **Lua DSL spec** and the generator produces a complete, production-ready `xxx.lua` module.
++
++## Motivation
++
++APISIX admin resources share a common pattern:
++
++```lua
++return resource.new({
++    name = "xxx",
++    kind = "xxx",
++    schema = core.schema.xxx,
++    checker = check_conf,          -- custom validation
++    encrypt_conf = encrypt_conf,   -- encryption hook
++    unsupported_methods = {...},   -- route constraints
++    delete_checker = delete_checker, -- reference guard
++    list_filter_fields = {...},    -- query filters
++})
++```
++
++Each resource module differs only in:
++1. The **schema** it validates against
++2. The **checker** function (custom business logic)
++3. The **encrypt_conf** function (sensitive field handling)
++4. **unsupported_methods** (HTTP method restrictions)
++5. **delete_checker** (reference integrity guards)
++6. **list_filter_fields** (query parameter filters)
++
++The generator abstracts these differences into a declarative spec.
++
++## Quick Start
++
++```bash
++# Generate a resource module from a spec
++lua tools/resource-generator/generator.lua \
++    tools/resource-generator/specs/consumers.lua \
++    apisix/admin/consumers.lua
++
++# Omit output path to print to stdout
++lua tools/resource-generator/generator.lua \
++    tools/resource-generator/specs/consumers.lua
++```
++
++## Spec File Format (Lua DSL)
++
++A spec file is a Lua script that returns a configuration table:
++
++```lua
++return {
++    resource = { ... },
++    schema = "...",
++    unsupported_methods = { ... },
++    checker = { ... },
++    encrypt_conf = { ... },
++    delete_checker = { ... },
++    list_filter_fields = { ... },
++    extra_imports = { ... },
++}
++```
++
++### Field Reference
++
++#### `resource` (required)
++
++| Field | Type | Description | Example |
++|-------|------|-------------|---------|
++| `name` | string | etcd key prefix and module name | `"consumers"` |
++| `kind` | string | Human-readable singular name for error messages | `"consumer"` |
++
++#### `schema` (required)
++
++String referencing the JSON Schema in `core.schema.*`. The generator emits `schema = core.schema.<value>`.
++
++```lua
++schema = "consumer"  -- generates: schema = core.schema.consumer
++```
++
++#### `unsupported_methods` (optional)
++
++Array of HTTP methods to disable. Each causes the corresponding handler to return 405.
++
++```lua
++unsupported_methods = { "post", "patch" }
++```
++
++#### `checker` (optional)
++
++Defines the `check_conf` function. Three modes:
++
++##### Mode: `"builtin"` (default)
++
++Simple schema validation only. No custom logic needed.
++
++```lua
++checker = {
++    mode = "builtin",
++    return_value = "need_id and id or true",  -- default
++}
++```
++
++##### Mode: `"custom"`
++
++Full custom checker. You provide the entire function body.
++
++```lua
++checker = {
++    mode = "custom",
++    code = [[
++        local ok, err = apisix_ssl.check_ssl_conf(false, conf)
++        if not ok then
++            return nil, {error_msg = err}
++        end
++        return need_id and id or true
++    ]],
++}
++```
++
++##### Mode: `"composed"` (recommended for most resources)
++
++Starts with the builtin schema check, then appends extra validation steps.
++
++```lua
++checker = {
++    mode = "composed",
++
++    extra_checks = {
++        {
++            name = "username_consistency",
++            code = [[
++                if id and id ~= conf.username then
++                    return nil, {error_msg = "wrong username"}
++                end
++            ]],
++        },
++        {
++            name = "group_id_reference",
++            requires = {
++                { module = "apisix.admin.plugins", as = "admin_plugins" },
++            },
++            code = [[
++                if conf.group_id and not opts.skip_references_check then
++                    local key = "/consumer_groups/" .. conf.group_id
++                    local res, err = core.etcd.get(key)
++                    if not res then
++                        return nil, {error_msg = "failed to fetch: " .. err}
++                    end
++                    if res.status ~= 200 then
++                        return nil, {error_msg = "not found, code: " .. res.status}
++                    end
++                end
++            ]],
++        },
++    },
++
++    return_value = "conf.username",
++}
++```
++
++**Checker function parameters:**
++- `id` — the resource ID from the URL path
++- `conf` — the configuration table from the request body
++- `need_id` — boolean, whether an ID is required for this operation
++- `schema` — the JSON schema reference
++- `opts` — options table (e.g., `opts.skip_references_check`)
++
++**Return convention:**
++- On failure: `return nil, {error_msg = "description"}`
++- On success: `return <return_value>` (typically `id`, `true`, or `conf.username`)
++
++#### `encrypt_conf` (optional)
++
++Defines the `encrypt_conf` function for sensitive field encryption.
++
++##### Mode: `"plugins"` (most common)
++
++Encrypts all plugin configurations.
++
++```lua
++encrypt_conf = {
++    mode = "plugins",
++    schema_type = "TYPE_CONSUMER",  -- optional: TYPE_ROUTE (default), TYPE_CONSUMER, TYPE_METADATA
++    local_name = "plugins_encrypt_conf",  -- the local variable name for the import
++}
++```
++
++##### Mode: `"custom"`
++
++Full custom encryption logic.
++
++```lua
++encrypt_conf = {
++    mode = "custom",
++    code = [[
++        apisix_upstream.encrypt_conf(conf.upstream)
++        plugins_encrypt_conf(conf.plugins)
++    ]],
++}
++```
++
++#### `delete_checker` (optional)
++
++Defines a pre-delete reference integrity check.
++
++##### Mode: `"builtin_reference"`
++
++Scans another resource type for references to the ID being deleted.
++
++```lua
++delete_checker = {
++    mode = "builtin_reference",
++    reference_resource = "consumers",      -- resource to scan
++    reference_field = "group_id",          -- field to match against the ID
++    get_function = "consumers",            -- function to get the resource list
++    error_msg_template = "can not delete this consumer group, consumer [{ref_id}] is still using it now",
++}
++```
++
++Placeholders in `error_msg_template`:
++- `{ref_id}` — replaced with the referencing resource's ID
++
++##### Mode: `"custom"`
++
++Full custom delete checker.
++
++```lua
++delete_checker = {
++    mode = "custom",
++    code = [[
++        local routes, routes_ver = get_routes()
++        if routes_ver and routes then
++            for _, route in ipairs(routes) do
++                if type(route) == "table" and route.value
++                   and route.value.plugin_config_id
++                   and tostring(route.value.plugin_config_id) == id then
++                    return 400, {error_msg = "can not delete this plugin config, route [" .. route.value.id .. "] is still using it now"}
++                end
++            end
++        end
++        return nil, nil
++    ]],
++}
++```
++
++#### `list_filter_fields` (optional)
++
++Fields that can be used as query parameters to filter list results.
++
++```lua
++list_filter_fields = { "service_id", "upstream_id" }
++```
++
++#### `extra_imports` (optional)
++
++Additional Lua modules to import at the top of the generated file.
++
++```lua
++extra_imports = {
++    -- Simple require with local name
++    { module = "apisix.admin.plugins", as = "plugins" },
++
++    -- Import a specific member function
++    { module = "apisix.admin.plugins", alias = "plugins_encrypt_conf", member = "encrypt_conf" },
++
++    -- Import a value from a module (e.g., a function)
++    { module = "apisix.consumer", member = "consumers" },
++}
++```
++
++## Architecture
++
++```
++tools/resource-generator/
++├── generator.lua          # Main generator script
++├── yaml_parser.lua        # (legacy) YAML parser — use Lua DSL specs instead
++├── specs/                 # Resource specification files
++│   ├── consumers.lua
++│   ├── consumer_groups.lua
++│   ├── global_rules.lua
++│   └── plugin_metadata.lua
++└── README.md              # This file
++```
++
++## Generated Code Structure
++
++The generator produces a file with this structure:
++
++```lua
++-- License header
++-- Standard imports (core, resource) + extra_imports
++
++-- check_conf function (from checker spec)
++
++-- encrypt_conf function (from encrypt_conf spec, if defined)
++
++-- delete_checker function (from delete_checker spec, if defined)
++
++return resource.new({
++    name = "...",
++    kind = "...",
++    schema = core.schema.<schema>,
++    checker = check_conf,
++    encrypt_conf = encrypt_conf,       -- if defined
++    unsupported_methods = {...},       -- if defined
++    list_filter_fields = {...},        -- if defined
++    delete_checker = delete_checker,   -- if defined
++})
++```
++
++## Migration Guide
++
++To migrate an existing resource module to the generator:
++
++1. **Identify the pattern** — look at the `resource.new()` call and the helper functions
++2. **Create a spec file** — map each component to the DSL fields
++3. **Run the generator** — compare output with the original
++4. **Replace the original** — once output matches, replace the file
++
++### Example: Migrating `consumers.lua`
++
++Original file has:
++- `check_conf` with username check, plugin validation, group_id reference
++- `encrypt_conf` for plugin encryption
++- `unsupported_methods = {"post", "patch"}`
++
++Corresponding spec: see `specs/consumers.lua`
++
++## Extending the Generator
++
++To add new generation capabilities:
++
++1. Add a new mode to the relevant dispatcher function (e.g., `gen_checker`)
++2. Add a new template function (e.g., `gen_checker_<new_mode>`)
++3. Update the `generate()` assembly function if needed
++4. Add a spec example demonstrating the new feature
++
++## Testing
++
++Run the generator for each spec and diff against the original:
++
++```bash
++lua tools/resource-generator/generator.lua \
++    tools/resource-generator/specs/consumers.lua \
++    /tmp/consumers_generated.lua
++
++diff -u apisix/admin/consumers.lua /tmp/consumers_generated.lua
++```
++
++Minor whitespace differences are expected. The logic should be identical.
+diff --git a/tools/resource-generator/generator.lua b/tools/resource-generator/generator.lua
+new file mode 100644
+index 00000000..5b41eb7b
+--- /dev/null
++++ b/tools/resource-generator/generator.lua
+@@ -0,0 +1,451 @@
++--
++-- Licensed to the Apache Software Foundation (ASF) under one or more
++-- contributor license agreements.  See the NOTICE file distributed with
++-- this work for additional information regarding copyright ownership.
++-- The ASF licenses this file to You under the Apache License, Version 2.0
++-- (the "License"); you may not use this file except in compliance with
++-- the License.  You may obtain a copy of the License at
++--
++--     http://www.apache.org/licenses/LICENSE-2.0
++--
++-- Unless required by applicable law or agreed to in writing, software
++-- distributed under the License is distributed on an "AS IS" BASIS,
++-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++-- See the License for the specific language governing permissions and
++-- limitations under the License.
++--
++-- APISIX Admin Resource Code Generator
++-- =====================================
++-- Reads a Lua DSL spec and generates a complete admin resource module.
++--
++-- Usage:
++--   lua generator.lua <spec_file.lua> [output_file.lua]
++--
++-- If output_file is omitted, writes to stdout.
++--
++-- Spec file format (Lua DSL):
++--   return {
++--       resource = { name = "consumers", kind = "consumer" },
++--       schema   = "consumer",
++--       unsupported_methods = { "post", "patch" },
++--       checker  = { ... },
++--       encrypt_conf = { ... },
++--       delete_checker = { ... },
++--       list_filter_fields = { "service_id" },
++--       extra_imports = { ... },
++--   }
++--
++local arg = arg
++local io = io
++local string = string
++local table = table
++local type = type
++local ipairs = ipairs
++local tostring = tostring
++local assert = assert
++local error = error
++
++-- ============================================================================
++-- Spec loader
++-- ============================================================================
++local function load_spec(path)
++    local f, err = io.open(path, "r")
++    if not f then
++        error("cannot open spec file: " .. tostring(err))
++    end
++    local content = f:read("*all")
++    f:close()
++
++    local fn, err = loadstring(content, "@" .. path)
++    if not fn then
++        error("invalid spec file: " .. tostring(err))
++    end
++    local spec = fn()
++    if type(spec) ~= "table" then
++        error("spec file must return a table")
++    end
++    return spec
++end
++
++-- ============================================================================
++-- Template helpers
++-- ============================================================================
++local function indent_lines(text, spaces)
++    local pad = string.rep(" ", spaces)
++    local result = {}
++    for line in text:gmatch("[^\n]*\n?") do
++        if line ~= "" and line ~= "\n" then
++            table.insert(result, pad .. line)
++        elseif line == "\n" then
++            table.insert(result, "")
++        end
++    end
++    return table.concat(result, "\n")
++end
++
++local function dedent(text)
++    local leading = text:match("^(\n*)(%s*)")
++    if not leading then return text end
++    local spaces = leading:len()
++    if spaces == 0 then return text end
++    local pattern = "\n" .. string.rep(" ", spaces)
++    return text:gsub(pattern, "\n"):gsub("^" .. string.rep(" ", spaces), "")
++end
++
++-- ============================================================================
++-- Code generation sections
++-- ============================================================================
++
++-- License header
++local function gen_license()
++    return [[--
++-- Licensed to the Apache Software Foundation (ASF) under one or more
++-- contributor license agreements.  See the NOTICE file distributed with
++-- this work for additional information regarding copyright ownership.
++-- The ASF licenses this file to You under the Apache License, Version 2.0
++-- (the "License"); you may not use this file except in compliance with
++-- the License.  You may obtain a copy of the License at
++--
++--     http://www.apache.org/licenses/LICENSE-2.0
++--
++-- Unless required by applicable law or agreed to in writing, software
++-- distributed under the License is distributed on an "AS IS" BASIS,
++-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++-- See the License for the specific language governing permissions and
++-- limitations under the License.
++--]]
++end
++
++-- Standard imports
++local function gen_imports(spec)
++    local lines = {}
++    table.insert(lines, 'local core = require("apisix.core")')
++    table.insert(lines, 'local resource = require("apisix.admin.resource")')
++
++    if spec.extra_imports then
++        for _, imp in ipairs(spec.extra_imports) do
++            if imp.member then
++                table.insert(lines,
++                    string.format('local %s = require("%s").%s',
++                        imp.alias or imp.as, imp.module, imp.member))
++            elseif imp.as then
++                table.insert(lines,
++                    string.format('local %s = require("%s")', imp.as, imp.module))
++            else
++                table.insert(lines,
++                    string.format('require("%s")', imp.module))
++            end
++        end
++    end
++
++    table.insert(lines, "")
++    return table.concat(lines, "\n")
++end
++
++-- Checker function: mode = "builtin"
++local function gen_checker_builtin(spec)
++    local id_return = spec.checker.return_value or "need_id and id or true"
++    return string.format([[
++local function check_conf(id, conf, need_id, schema, opts)
++    opts = opts or {}
++    local ok, err = core.schema.check(schema, conf)
++    if not ok then
++        return nil, {error_msg = "invalid configuration: " .. err}
++    end
++
++    return %s
++end
++]], id_return)
++end
++
++-- Checker function: mode = "custom"
++local function gen_checker_custom(spec)
++    local code = spec.checker.code
++    if not code then
++        error("checker.mode='custom' requires checker.code")
++    end
++    return string.format([[
++local function check_conf(id, conf, need_id, schema, opts)
++    opts = opts or {}
++%s
++end
++]], indent_lines(dedent(code), 4))
++end
++
++-- Checker function: mode = "composed"
++local function gen_checker_composed(spec)
++    local parts = {}
++
++    table.insert(parts, [[local function check_conf(id, conf, need_id, schema, opts)
++    opts = opts or {}
++    local ok, err = core.schema.check(schema, conf)
++    if not ok then
++        return nil, {error_msg = "invalid configuration: " .. err}
++    end
++]])
++
++    if spec.checker.extra_checks then
++        for _, check in ipairs(spec.checker.extra_checks) do
++            if check.requires then
++                for _, req in ipairs(check.requires) do
++                    -- require is already handled in imports; just inline the code
++                end
++            end
++            if check.code then
++                table.insert(parts, indent_lines(dedent(check.code), 4))
++                table.insert(parts, "")
++            end
++        end
++    end
++
++    local ret = spec.checker.return_value or "true"
++    table.insert(parts, string.format("    return %s\nend", ret))
++
++    return table.concat(parts, "\n")
++end
++
++-- Checker function dispatcher
++local function gen_checker(spec)
++    if not spec.checker then
++        return gen_checker_builtin(spec)
++    end
++
++    local mode = spec.checker.mode or "builtin"
++    if mode == "builtin" then
++        return gen_checker_builtin(spec)
++    elseif mode == "custom" then
++        return gen_checker_custom(spec)
++    elseif mode == "composed" then
++        return gen_checker_composed(spec)
++    else
++        error("unknown checker mode: " .. tostring(mode))
++    end
++end
++
++-- Encrypt conf: mode = "plugins"
++local function gen_encrypt_plugins(spec)
++    local schema_type = ""
++    if spec.encrypt_conf.schema_type then
++        schema_type = ", core.schema." .. spec.encrypt_conf.schema_type
++    end
++    local local_name = spec.encrypt_conf.local_name or "plugins_encrypt_conf"
++    return string.format([[
++local function encrypt_conf(id, conf)
++    %s(conf.plugins%s)
++end
++]], local_name, schema_type)
++end
++
++-- Encrypt conf: mode = "custom"
++local function gen_encrypt_custom(spec)
++    local code = spec.encrypt_conf.code
++    if not code then
++        error("encrypt_conf.mode='custom' requires encrypt_conf.code")
++    end
++    return string.format([[
++local function encrypt_conf(id, conf)
++%s
++end
++]], indent_lines(dedent(code), 4))
++end
++
++-- Encrypt conf dispatcher
++local function gen_encrypt_conf(spec)
++    if not spec.encrypt_conf then
++        return ""
++    end
++
++    local mode = spec.encrypt_conf.mode or "plugins"
++    if mode == "plugins" then
++        return gen_encrypt_plugins(spec)
++    elseif mode == "custom" then
++        return gen_encrypt_custom(spec)
++    else
++        error("unknown encrypt_conf mode: " .. tostring(mode))
++    end
++end
++
++-- Delete checker: mode = "builtin_reference"
++local function gen_delete_checker_builtin(spec)
++    local dc = spec.delete_checker
++    local ref_resource = dc.reference_resource
++    local ref_field = dc.reference_field or "id"
++    local ref_kind = dc.reference_kind or ref_resource
++    local err_msg = dc.error_msg_template or
++        ("can not delete this " .. (spec.resource.kind or ref_resource) ..
++         ", " .. ref_resource .. " [{ref_id}] is still using it now")
++
++    local err_lua = err_msg:gsub("%{ref_id%}", '" .. %s.value.id .. "')
++        :gsub("%{ref_kind%}", ref_kind)
++
++    local get_fn = dc.get_function or ref_resource
++
++    return string.format([[
++local function delete_checker(id)
++    local %s, %s_ver = %s()
++    if %s_ver and %s then
++        for _, item in ipairs(%s) do
++            if type(item) == "table" and item.value
++               and item.value.%s
++               and tostring(item.value.%s) == id then
++                return 400, {error_msg = "%s"}
++            end
++        end
++    end
++
++    return nil, nil
++end
++]], ref_resource, ref_resource, get_fn,
++    ref_resource, ref_resource, ref_resource,
++    ref_field, ref_field, err_lua)
++end
++
++-- Delete checker: mode = "custom"
++local function gen_delete_checker_custom(spec)
++    local code = spec.delete_checker.code
++    if not code then
++        error("delete_checker.mode='custom' requires delete_checker.code")
++    end
++    return string.format([[
++local function delete_checker(id)
++%s
++end
++]], indent_lines(dedent(code), 4))
++end
++
++-- Delete checker dispatcher
++local function gen_delete_checker(spec)
++    if not spec.delete_checker then
++        return ""
++    end
++
++    local mode = spec.delete_checker.mode or "builtin_reference"
++    if mode == "builtin_reference" then
++        return gen_delete_checker_builtin(spec)
++    elseif mode == "custom" then
++        return gen_delete_checker_custom(spec)
++    else
++        error("unknown delete_checker mode: " .. tostring(mode))
++    end
++end
++
++-- Unsupported methods array
++local function gen_unsupported_methods(spec)
++    if not spec.unsupported_methods or #spec.unsupported_methods == 0 then
++        return ""
++    end
++    local items = {}
++    for _, m in ipairs(spec.unsupported_methods) do
++        table.insert(items, string.format('"%s"', m))
++    end
++    return string.format("    unsupported_methods = {%s},", table.concat(items, ", "))
++end
++
++-- List filter fields
++local function gen_list_filter_fields(spec)
++    if not spec.list_filter_fields or #spec.list_filter_fields == 0 then
++        return ""
++    end
++    local items = {}
++    for _, f in ipairs(spec.list_filter_fields) do
++        table.insert(items, string.format('        %s = true,', f))
++    end
++    return string.format("    list_filter_fields = {\n%s\n    },", table.concat(items, "\n"))
++end
++
++-- ============================================================================
++-- Main assembly
++-- ============================================================================
++local function generate(spec)
++    local sections = {}
++
++    -- 1. License header
++    table.insert(sections, gen_license())
++    table.insert(sections, "")
++
++    -- 2. Imports
++    table.insert(sections, gen_imports(spec))
++
++    -- 3. Checker function
++    table.insert(sections, gen_checker(spec))
++    table.insert(sections, "")
++
++    -- 4. Encrypt conf function
++    local encrypt_code = gen_encrypt_conf(spec)
++    if encrypt_code ~= "" then
++        table.insert(sections, encrypt_code)
++        table.insert(sections, "")
++    end
++
++    -- 5. Delete checker function
++    local delete_code = gen_delete_checker(spec)
++    if delete_code ~= "" then
++        table.insert(sections, delete_code)
++        table.insert(sections, "")
++    end
++
++    -- 6. resource.new() call
++    local res = spec.resource
++    local res_opts = {}
++    table.insert(res_opts, string.format('    name = "%s",', res.name))
++    table.insert(res_opts, string.format('    kind = "%s",', res.kind))
++    table.insert(res_opts, string.format('    schema = core.schema.%s,', spec.schema))
++    table.insert(res_opts, "    checker = check_conf,")
++
++    if spec.encrypt_conf then
++        table.insert(res_opts, "    encrypt_conf = encrypt_conf,")
++    end
++
++    local um = gen_unsupported_methods(spec)
++    if um ~= "" then
++        table.insert(res_opts, um)
++    end
++
++    local lff = gen_list_filter_fields(spec)
++    if lff ~= "" then
++        table.insert(res_opts, lff)
++    end
++
++    if spec.delete_checker then
++        table.insert(res_opts, "    delete_checker = delete_checker")
++    end
++
++    local res_call = string.format("return resource.new({\n%s\n})",
++        table.concat(res_opts, "\n"))
++    table.insert(sections, res_call)
++
++    return table.concat(sections, "\n") .. "\n"
++end
++
++-- ============================================================================
++-- CLI entry point
++-- ============================================================================
++local function main()
++    local spec_path = arg[1]
++    local output_path = arg[2]
++
++    if not spec_path then
++        io.stderr:write("Usage: lua generator.lua <spec_file.lua> [output_file.lua]\n")
++        os.exit(1)
++    end
++
++    local spec = load_spec(spec_path)
++    local output = generate(spec)
++
++    if output_path then
++        local f, err = io.open(output_path, "w")
++        if not f then
++            io.stderr:write("cannot open output file: " .. tostring(err) .. "\n")
++            os.exit(1)
++        end
++        f:write(output)
++        f:close()
++        io.stderr:write("Generated: " .. output_path .. "\n")
++    else
++        io.write(output)
++    end
++end
++
++main()
++
++return { generate = generate, load_spec = load_spec }
+diff --git a/tools/resource-generator/specs/consumer_groups.lua b/tools/resource-generator/specs/consumer_groups.lua
+new file mode 100644
+index 00000000..76460f68
+--- /dev/null
++++ b/tools/resource-generator/specs/consumer_groups.lua
+@@ -0,0 +1,61 @@
++--
++-- APISIX Admin Resource Spec: consumer_groups
++-- ============================================
++-- This spec generates apisix/admin/consumer_group.lua
++--
++-- Run: lua tools/resource-generator/generator.lua \
++--          tools/resource-generator/specs/consumer_groups.lua \
++--          apisix/admin/consumer_group.lua
++--
++return {
++    resource = {
++        name = "consumer_groups",
++        kind = "consumer group",
++    },
++
++    schema = "consumer_group",
++
++    unsupported_methods = { "post" },
++
++    checker = {
++        mode = "composed",
++
++        extra_checks = {
++            {
++                name = "plugins_validation",
++                requires = {
++                    { module = "apisix.admin.plugins", as = "schema_plugin" },
++                },
++                code = [[
++                    local ok, err = schema_plugin(conf.plugins)
++                    if not ok then
++                        return nil, {error_msg = err}
++                    end
++                ]],
++            },
++        },
++
++        return_value = "true",
++    },
++
++    encrypt_conf = {
++        mode = "plugins",
++        local_name = "plugins_encrypt_conf",
++    },
++
++    delete_checker = {
++        mode = "builtin_reference",
++        reference_resource = "consumers",
++        reference_field = "group_id",
++        get_function = "consumers",
++        error_msg_template = "can not delete this consumer group, consumer [{ref_id}] is still using it now",
++    },
++
++    list_filter_fields = nil,
++
++    extra_imports = {
++        { module = "apisix.consumer", member = "consumers" },
++        { module = "apisix.admin.plugins", as = "schema_plugin" },
++        { module = "apisix.admin.plugins", alias = "plugins_encrypt_conf", member = "encrypt_conf" },
++    },
++}
+diff --git a/tools/resource-generator/specs/consumers.lua b/tools/resource-generator/specs/consumers.lua
+new file mode 100644
+index 00000000..4a6827dc
+--- /dev/null
++++ b/tools/resource-generator/specs/consumers.lua
+@@ -0,0 +1,85 @@
++--
++-- APISIX Admin Resource Spec: consumers
++-- ======================================
++-- This spec generates apisix/admin/consumers.lua
++--
++-- Run: lua tools/resource-generator/generator.lua \
++--          tools/resource-generator/specs/consumers.lua \
++--          apisix/admin/consumers.lua
++--
++return {
++    resource = {
++        name = "consumers",
++        kind = "consumer",
++    },
++
++    schema = "consumer",
++
++    unsupported_methods = { "post", "patch" },
++
++    checker = {
++        mode = "composed",
++
++        extra_checks = {
++            {
++                name = "username_consistency",
++                code = [[
++                    if id and id ~= conf.username then
++                        return nil, {error_msg = "wrong username" }
++                    end
++                ]],
++            },
++            {
++                name = "plugins_validation",
++                requires = {
++                    { module = "apisix.admin.plugins", as = "admin_plugins" },
++                },
++                code = [[
++                    if conf.plugins then
++                        local ok, err = admin_plugins.check_schema(conf.plugins, core.schema.TYPE_CONSUMER)
++                        if not ok then
++                            return nil, {error_msg = "invalid plugins configuration: " .. err}
++                        end
++                    end
++                ]],
++            },
++            {
++                name = "group_id_reference",
++                code = [[
++                    if conf.group_id and not opts.skip_references_check then
++                        local key = "/consumer_groups/" .. conf.group_id
++                        local res, err = core.etcd.get(key)
++                        if not res then
++                            return nil, {error_msg = "failed to fetch consumer group info by "
++                                             .. "consumer group id [" .. conf.group_id .. "]: "
++                                             .. err}
++                        end
++
++                        if res.status ~= 200 then
++                            return nil, {error_msg = "failed to fetch consumer group info by "
++                                             .. "consumer group id [" .. conf.group_id .. "], "
++                                             .. "response code: " .. res.status}
++                        end
++                    end
++                ]],
++            },
++        },
++
++        return_value = "conf.username",
++    },
++
++    encrypt_conf = {
++        mode = "plugins",
++        schema_type = "TYPE_CONSUMER",
++        local_name = "plugins_encrypt_conf",
++    },
++
++    delete_checker = nil,
++
++    list_filter_fields = nil,
++
++    extra_imports = {
++        { module = "apisix.admin.plugins", as = "plugins" },
++        { module = "apisix.admin.plugins", alias = "plugins_encrypt_conf", member = "encrypt_conf" },
++    },
++}
+diff --git a/tools/resource-generator/specs/consumers.yaml b/tools/resource-generator/specs/consumers.yaml
+new file mode 100644
+index 00000000..59a9508d
+--- /dev/null
++++ b/tools/resource-generator/specs/consumers.yaml
+@@ -0,0 +1,175 @@
++# Licensed to the Apache Software Foundation (ASF) under one or more
++# contributor license agreements.  See the NOTICE file distributed with
++# this work for additional information regarding copyright ownership.
++# The ASF licenses this file to You under the Apache License, Version 2.0
++# (the "License"); you may not use this file except in compliance with
++# the License.  You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++#
++# ============================================================================
++# APISIX Admin Resource Specification (YAML DSL)
++# ============================================================================
++# This file defines the input format for the resource code generator.
++# A single YAML spec describes everything needed to generate a complete
++# admin resource module (e.g. consumers.lua, routes.lua, upstreams.lua).
++# ============================================================================
++
++# ---------------------------------------------------------------------------
++# 1. Basic metadata
++# ---------------------------------------------------------------------------
++resource:
++  # The etcd key prefix (also used as the module name), e.g. "consumers"
++  name: "consumers"
++  # Human-readable singular name for error messages, e.g. "consumer"
++  kind: "consumer"
++
++# ---------------------------------------------------------------------------
++# 2. Schema reference
++# ---------------------------------------------------------------------------
++# Points to the JSON Schema definition in core.schema.*
++# The generator emits:  schema = core.schema.<schema_name>
++schema: "consumer"
++
++# ---------------------------------------------------------------------------
++# 3. Route-level constraints
++# ---------------------------------------------------------------------------
++# HTTP methods that should NOT be registered for this resource.
++# Each entry causes the corresponding method handler to return 405.
++# Valid values: "get", "post", "put", "delete", "patch"
++unsupported_methods:
++  - "post"
++  - "patch"
++
++# ---------------------------------------------------------------------------
++# 4. Custom checker logic
++# ---------------------------------------------------------------------------
++# The checker function validates the incoming configuration beyond what
++# the JSON Schema can express. The generator supports two modes:
++#
++#   A) "builtin" — no custom checker needed; the generator emits a simple
++#      wrapper that calls core.schema.check and returns the id.
++#
++#   B) "custom" — the user provides a Lua code snippet that will be
++#      inlined as the check_conf function body. The snippet receives the
++#      same parameters as the original: (id, conf, need_id, schema, opts).
++#
++#   C) "composed" — the generator emits a checker that first runs the
++#      builtin schema check, then runs one or more "extra_checks".
++#
++# For mode B and C, the snippet is placed inside the function body.
++# The snippet should:
++#   - Return `nil, {error_msg = "..."}` on failure
++#   - Return `true` (or the id value) on success
++checker:
++  mode: "composed"
++
++  # Extra validation steps appended after the base schema check.
++  # Each step is a named block of Lua code.
++  extra_checks:
++    # --- username consistency check ---
++    # Ensures the URL path username (id) matches conf.username.
++    - name: "username_consistency"
++      code: |
++        if id and id ~= conf.username then
++            return nil, {error_msg = "wrong username" }
++        end
++
++    # --- plugins validation ---
++    # Validates consumer plugins using the admin plugin checker.
++    - name: "plugins_validation"
++      requires:
++        - module: "apisix.admin.plugins"
++          as: "admin_plugins"
++      code: |
++        if conf.plugins then
++            local ok, err = admin_plugins.check_schema(conf.plugins, core.schema.TYPE_CONSUMER)
++            if not ok then
++                return nil, {error_msg = "invalid plugins configuration: " .. err}
++            end
++        end
++
++    # --- group_id reference check ---
++    # Verifies that the referenced consumer_group actually exists in etcd.
++    - name: "group_id_reference"
++      code: |
++        if conf.group_id and not opts.skip_references_check then
++            local key = "/consumer_groups/" .. conf.group_id
++            local res, err = core.etcd.get(key)
++            if not res then
++                return nil, {error_msg = "failed to fetch consumer group info by "
++                                         .. "consumer group id [" .. conf.group_id .. "]: "
++                                         .. err}
++            end
++
++            if res.status ~= 200 then
++                return nil, {error_msg = "failed to fetch consumer group info by "
++                                         .. "consumer group id [" .. conf.group_id .. "], "
++                                         .. "response code: " .. res.status}
++            end
++        end
++
++  # Return value expression: what the checker function returns on success.
++  # Common values: "id", "true", "conf.username"
++  return_value: "conf.username"
++
++# ---------------------------------------------------------------------------
++# 5. Encryption hook
++# ---------------------------------------------------------------------------
++# If the resource stores sensitive fields (private keys, plugin configs),
++# define an encrypt_conf hook.
++#
++# Supported modes:
++#   "plugins"  — encrypt all plugin configs (the most common case)
++#   "custom"   — provide a custom Lua snippet
++encrypt_conf:
++  mode: "plugins"
++  # For mode "plugins", specify the schema type constant.
++  # Valid: "TYPE_CONSUMER", "TYPE_METADATA", or omit for default (TYPE_ROUTE).
++  schema_type: "TYPE_CONSUMER"
++
++# ---------------------------------------------------------------------------
++# 6. Delete checker
++# ---------------------------------------------------------------------------
++# Before deleting a resource, optionally verify that no other resources
++# reference it. The generator supports:
++#
++#   "builtin_reference" — check a specific resource type for references.
++#   "custom"            — provide a full Lua snippet.
++delete_checker:
++  mode: "builtin_reference"
++  # The resource to scan for references.
++  reference_resource: "consumers"
++  # The function to call to get the resource list.
++  # If omitted, defaults to calling <reference_resource>() from the
++  # corresponding module.
++  reference_field: "group_id"
++  # Error message template. {ref_kind} and {ref_id} are placeholders.
++  error_msg_template: "can not delete this consumer group, consumer [{ref_id}] is still using it now"
++
++# ---------------------------------------------------------------------------
++# 7. List filter fields
++# ---------------------------------------------------------------------------
++# Fields that can be used to filter list results via query parameters.
++# Optional; omit if not needed.
++# list_filter_fields:
++#   - "service_id"
++#   - "upstream_id"
++
++# ---------------------------------------------------------------------------
++# 8. Additional module imports
++# ---------------------------------------------------------------------------
++# Extra Lua modules to require at the top of the generated file.
++# Each entry: { module_path, local_name }
++extra_imports:
++  - module: "apisix.admin.plugins"
++    as: "plugins"
++  - module: "apisix.admin.plugins"
++    alias: "plugins_encrypt_conf"
++    member: "encrypt_conf"
+diff --git a/tools/resource-generator/specs/global_rules.lua b/tools/resource-generator/specs/global_rules.lua
+new file mode 100644
+index 00000000..2261bd27
+--- /dev/null
++++ b/tools/resource-generator/specs/global_rules.lua
+@@ -0,0 +1,76 @@
++--
++-- APISIX Admin Resource Spec: global_rules
++-- =========================================
++-- This spec generates apisix/admin/global_rules.lua
++--
++-- Run: lua tools/resource-generator/generator.lua \
++--          tools/resource-generator/specs/global_rules.lua \
++--          apisix/admin/global_rules.lua
++--
++return {
++    resource = {
++        name = "global_rules",
++        kind = "global rule",
++    },
++
++    schema = "global_rule",
++
++    unsupported_methods = { "post" },
++
++    checker = {
++        mode = "custom",
++        code = [[
++            local ok, err = core.schema.check(schema, conf)
++            if not ok then
++                return nil, {error_msg = "invalid configuration: " .. err}
++            end
++
++            local ok, err = schema_plugin(conf.plugins)
++            if not ok then
++                return nil, {error_msg = err}
++            end
++
++            -- Check for plugin conflicts with existing global rules
++            if conf.plugins then
++                local global_rules = get_global_rules()
++                if global_rules then
++                    for _, existing_rule in ipairs(global_rules) do
++                        -- Skip checking against itself when updating
++                        if existing_rule.value and existing_rule.value.id and
++                           tostring(existing_rule.value.id) ~= tostring(id) then
++
++                            if existing_rule.value.plugins then
++                                -- Check for any overlapping plugins
++                                for plugin_name, _ in pairs(conf.plugins) do
++                                    if existing_rule.value.plugins[plugin_name] then
++                                        return nil, {
++                                            error_msg = "plugin '" .. plugin_name ..
++                                            "' already exists in global rule with id '" ..
++                                            existing_rule.value.id .. "'"
++                                        }
++                                    end
++                                end
++                            end
++                        end
++                    end
++                end
++            end
++
++            return true
++        ]],
++    },
++
++    encrypt_conf = {
++        mode = "plugins",
++        local_name = "plugins_encrypt_conf",
++    },
++
++    delete_checker = nil,
++
++    list_filter_fields = nil,
++
++    extra_imports = {
++        { module = "apisix.admin.plugins", as = "schema_plugin" },
++        { module = "apisix.admin.plugins", alias = "plugins_encrypt_conf", member = "encrypt_conf" },
++    },
++}
+diff --git a/tools/resource-generator/specs/plugin_metadata.lua b/tools/resource-generator/specs/plugin_metadata.lua
+new file mode 100644
+index 00000000..a924a7d8
+--- /dev/null
++++ b/tools/resource-generator/specs/plugin_metadata.lua
+@@ -0,0 +1,64 @@
++--
++-- APISIX Admin Resource Spec: plugin_metadata
++-- ============================================
++-- This spec generates apisix/admin/plugin_metadata.lua
++--
++-- Run: lua tools/resource-generator/generator.lua \
++--          tools/resource-generator/specs/plugin_metadata.lua \
++--          apisix/admin/plugin_metadata.lua
++--
++return {
++    resource = {
++        name = "plugin_metadata",
++        kind = "plugin_metadata",
++    },
++
++    schema = "plugin_metadata",
++
++    unsupported_methods = { "post", "patch" },
++
++    checker = {
++        mode = "custom",
++        code = [[
++            local plugin_name = conf.name or conf._meta_name
++            if not plugin_name then
++                return nil, {error_msg = "missing plugin name"}
++            end
++
++            local plugin_object = require("apisix.plugins." .. plugin_name)
++            if not plugin_object then
++                return nil, {error_msg = "unknown plugin: " .. plugin_name}
++            end
++
++            if plugin_object.check_schema then
++                local ok, err = plugin_object.check_schema(conf, core.schema.TYPE_METADATA)
++                if not ok then
++                    return nil, {error_msg = err}
++                end
++            end
++
++            return true
++        ]],
++    },
++
++    encrypt_conf = {
++        mode = "custom",
++        code = [[
++            local plugin_name = conf.name or conf._meta_name
++            if plugin_name then
++                local plugin_object = require("apisix.plugins." .. plugin_name)
++                if plugin_object then
++                    plugin_encrypt_conf(plugin_name, conf, core.schema.TYPE_METADATA)
++                end
++            end
++        ]],
++    },
++
++    delete_checker = nil,
++
++    list_filter_fields = nil,
++
++    extra_imports = {
++        { module = "apisix.admin.plugins", alias = "plugin_encrypt_conf", member = "encrypt_conf" },
++    },
++}
+diff --git a/tools/resource-generator/yaml_parser.lua b/tools/resource-generator/yaml_parser.lua
+new file mode 100644
+index 00000000..607c16a1
+--- /dev/null
++++ b/tools/resource-generator/yaml_parser.lua
+@@ -0,0 +1,244 @@
++--
++-- Licensed to the Apache Software Foundation (ASF) under one or more
++-- contributor license agreements.  See the NOTICE file distributed with
++-- this work for additional information regarding copyright ownership.
++-- The ASF licenses this file to You under the Apache License, Version 2.0
++-- (the "License"); you may not use this file except in compliance with
++-- the License.  You may obtain a copy of the License at
++--
++--     http://www.apache.org/licenses/LICENSE-2.0
++--
++-- Unless required by applicable law or agreed to in writing, software
++-- distributed under the License is distributed on an "AS IS" BASIS,
++-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++-- See the License for the specific language governing permissions and
++-- limitations under the License.
++--
++-- A minimal YAML-like parser for the resource generator specs.
++-- Supports: scalars, lists, nested mappings, multi-line block scalars (|).
++-- This is NOT a full YAML parser — it handles the subset used by specs.
++--
++local type = type
++local string = string
++local table = table
++local ipairs = ipairs
++local tonumber = tonumber
++
++local _M = {}
++
++
++local function trim(s)
++    return s:gsub("^%s+", ""):gsub("%s+$", "")
++end
++
++
++local function get_indent(line)
++    local spaces = line:match("^(%s*)")
++    return spaces:len()
++end
++
++
++local function parse_value(val)
++    val = trim(val)
++    if val == "" then
++        return nil
++    end
++    if val == "true" then
++        return true
++    end
++    if val == "false" then
++        return false
++    end
++    if val == "null" or val == "~" then
++        return nil
++    end
++    local num = tonumber(val)
++    if num then
++        return num
++    end
++    -- strip quotes
++    if (val:sub(1, 1) == '"' and val:sub(-1) == '"') or
++       (val:sub(1, 1) == "'" and val:sub(-1) == "'") then
++        return val:sub(2, -2)
++    end
++    return val
++end
++
++
++function _M.parse(yaml_text)
++    local lines = {}
++    for line in yaml_text:gmatch("[^\r\n]+") do
++        table.insert(lines, line)
++    end
++
++    local root = {}
++    local stack = { { node = root, indent = -1 } }
++    local current_list = nil
++    local current_list_key = nil
++    local current_list_indent = -1
++    local block_scalar_key = nil
++    local block_scalar_indent = -1
++    local block_scalar_lines = nil
++
++    local function flush_block_scalar()
++        if block_scalar_key and block_scalar_lines then
++            local parent = stack[#stack].node
++            local val = table.concat(block_scalar_lines, "\n")
++            if parent[block_scalar_key] and type(parent[block_scalar_key]) == "table" then
++                parent[block_scalar_key].code = val
++            else
++                parent[block_scalar_key] = val
++            end
++        end
++        block_scalar_key = nil
++        block_scalar_lines = nil
++        block_scalar_indent = -1
++    end
++
++    local function find_parent_for_indent(indent)
++        while #stack > 1 and stack[#stack].indent >= indent do
++            table.remove(stack)
++        end
++        return stack[#stack].node
++    end
++
++    for _, line in ipairs(lines) do
++        -- skip empty lines and comments
++        if trim(line) ~= "" and not trim(line):match("^#") then
++            local indent = get_indent(line)
++            local content = trim(line)
++
++            -- flush block scalar if indent decreased
++            if block_scalar_key and indent <= block_scalar_indent then
++                flush_block_scalar()
++            end
++
++            -- list item
++            if content:match("^- ") then
++                local item_val = trim(content:sub(3))
++
++                -- check if this is a list of mappings (key: value after -)
++                if item_val:match("^[a-zA-Z_].*:") then
++                    -- start of a list item that is a mapping
++                    if not current_list or indent ~= current_list_indent then
++                        current_list = {}
++                        current_list_indent = indent
++                        local parent = find_parent_for_indent(indent)
++                        -- find the key this list belongs to
++                        for i = #stack, 1, -1 do
++                            if stack[i].indent < indent then
++                                -- the key was set at this level
++                                break
++                            end
++                        end
++                        -- attach to the most recent parent
++                        local pnode = stack[#stack].node
++                        -- find which key this list belongs to by scanning backwards
++                        -- we need to find the key that was last set at a lower indent
++                        -- For simplicity, we store it via a marker
++                        if current_list_key and pnode[current_list_key] == nil then
++                            pnode[current_list_key] = current_list
++                        elseif current_list_key and type(pnode[current_list_key]) ~= "table" then
++                            pnode[current_list_key] = current_list
++                        end
++                    end
++
++                    local item_map = {}
++                    table.insert(current_list, item_map)
++                    -- push item_map onto stack
++                    table.insert(stack, { node = item_map, indent = indent + 2 })
++
++                    -- parse the first key:value of the item
++                    local k, v = item_val:match("^([a-zA-Z_][a-zA-Z0-9_]*)%s*:%s*(.*)")
++                    if k then
++                        if v and v ~= "" then
++                            -- check for block scalar
++                            if v == "|" or v:match("^|%s*$") then
++                                block_scalar_key = k
++                                block_scalar_indent = indent + 4
++                                block_scalar_lines = {}
++                                item_map[k] = {}
++                            else
++                                item_map[k] = parse_value(v)
++                            end
++                        else
++                            item_map[k] = nil
++                        end
++                    end
++                else
++                    -- simple list item
++                    if not current_list or indent ~= current_list_indent then
++                        current_list = {}
++                        current_list_indent = indent
++                        local pnode = stack[#stack].node
++                        if current_list_key then
++                            pnode[current_list_key] = current_list
++                        end
++                    end
++                    table.insert(current_list, parse_value(item_val))
++                end
++            elseif content:match("^[a-zA-Z_][a-zA-Z0-9_]*%s*:") then
++                -- key: value mapping
++                if current_list and indent > current_list_indent then
++                    -- this is a key inside a list item mapping
++                    local item = current_list[#current_list]
++                    if type(item) == "table" then
++                        local k, v = content:match("^([a-zA-Z_][a-zA-Z0-9_]*)%s*:%s*(.*)")
++                        if k then
++                            if v and v ~= "" then
++                                if v == "|" or v:match("^|%s*$") then
++                                    block_scalar_key = k
++                                    block_scalar_indent = indent + 2
++                                    block_scalar_lines = {}
++                                    item[k] = {}
++                                else
++                                    item[k] = parse_value(v)
++                                end
++                            end
++                        end
++                    end
++                else
++                    current_list = nil
++                    current_list_key = nil
++                    flush_block_scalar()
++
++                    local k, v = content:match("^([a-zA-Z_][a-zA-Z0-9_]*)%s*:%s*(.*)")
++                    if k then
++                        local parent = find_parent_for_indent(indent)
++
++                        if v and v ~= "" then
++                            if v == "|" or v:match("^|%s*$") then
++                                block_scalar_key = k
++                                block_scalar_indent = indent + 2
++                                block_scalar_lines = {}
++                                parent[k] = {}
++                            else
++                                parent[k] = parse_value(v)
++                                current_list_key = k
++                            end
++                        else
++                            -- value is a nested mapping or list
++                            local child = {}
++                            parent[k] = child
++                            table.insert(stack, { node = child, indent = indent })
++                            current_list_key = k
++                        end
++                    end
++                end
++            end
++
++            -- block scalar content line
++            if block_scalar_key and indent > block_scalar_indent - 2 and
++               not content:match("^[a-zA-Z_][a-zA-Z0-9_]*%s*:") and
++               not content:match("^- ") then
++                table.insert(block_scalar_lines, line:sub(block_scalar_indent + 1))
++            end
++        end
++    end
++
++    flush_block_scalar()
++    return root
++end
++
++
++return _M
