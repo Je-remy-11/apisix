@@ -22,7 +22,7 @@ no_root_location();
 no_shuffle();
 log_level("info");
 
-run_tests;
+run_tests();
 
 __DATA__
 
@@ -302,7 +302,7 @@ GET /t
 passed
 
 
-=== TEST 6: simulate old encrypted data (backward compatibility test)
+=== TEST 6: simulate old encrypted data (backward compatibility check)
 --- config
     location /t {
         content_by_lua_block {

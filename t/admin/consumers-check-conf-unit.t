@@ -21,7 +21,7 @@ no_long_string();
 no_root_location();
 log_level("info");
 
-run_tests;
+run_tests();
 
 __DATA__
 
@@ -29,38 +29,14 @@ __DATA__
 --- config
     location /t {
         content_by_lua_block {
-            local consumers_admin = require("apisix.admin.consumers")
+            local consumers = require("apisix.admin.consumers")
             local core = require("apisix.core")
 
-            -- 模拟 checker 函数
-            local check_conf
-            for line in io.lines("apisix/admin/consumers.lua") do
-                if line:find("^local function check_conf") then
-                    check_conf = loadstring("return " .. line)
-                    break
-                end
-            end
-
-            -- 更直接的方法：直接 require 并获取内部函数
-            -- 由于我们不能直接访问局部函数，我们使用 resource 的 checker
-            local consumer_resource = consumers_admin
-
-            -- 测试 1: 验证正常的配置
-            local test_conf = {
-                username = "test-user",
-                desc = "test description",
-                plugins = {
-                    ["key-auth"] = {
-                        key = "test-key-123"
-                    }
-                }
-            }
-
-            -- 我们通过 inspect 验证资源的结构
-            ngx.say("Consumer admin resource loaded: ", type(consumer_resource))
-            ngx.say("Checker exists: ", consumer_resource.checker ~= nil)
-            ngx.say("Encrypt conf exists: ", consumer_resource.encrypt_conf ~= nil)
-            ngx.say("Unsupported methods: ", require("cjson.safe").encode(consumer_resource.unsupported_methods))
+            -- We'll verify the resource structure
+            ngx.say("Consumer admin resource loaded: ", type(consumers))
+            ngx.say("Checker exists: ", consumers.checker ~= nil)
+            ngx.say("Encrypt conf exists: ", consumers.encrypt_conf ~= nil)
+            ngx.say("Unsupported methods: ", require("cjson.safe").encode(consumers.unsupported_methods))
 
             ngx.say("passed")
         }
