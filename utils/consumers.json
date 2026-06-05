@@ -1,0 +1,34 @@
+{
+  "name": "consumers",
+  "kind": "consumer",
+  "schema": "core.schema.consumer",
+  "unsupported_methods": ["post", "patch"],
+  "imports": [
+    {
+      "local_name": "core",
+      "require": "apisix.core"
+    },
+    {
+      "local_name": "plugins",
+      "require": "apisix.admin.plugins"
+    },
+    {
+      "local_name": "plugins_encrypt_conf",
+      "require": "apisix.admin.plugins",
+      "property": "encrypt_conf"
+    },
+    {
+      "local_name": "resource",
+      "require": "apisix.admin.resource"
+    }
+  ],
+  "checker": {
+    "args": "username, conf, need_id, schema, opts",
+    "custom_logic": "if username and username ~= conf.username then\n    return nil, {error_msg = \"wrong username\" }\nend\n\nif conf.plugins then\n    ok, err = plugins.check_schema(conf.plugins, core.schema.TYPE_CONSUMER)\n    if not ok then\n        return nil, {error_msg = \"invalid plugins configuration: \" .. err}\n    end\nend\n\nif conf.group_id and not opts.skip_references_check then\n    local key = \"/consumer_groups/\" .. conf.group_id\n    local res, err = core.etcd.get(key)\n    if not res then\n        return nil, {error_msg = \"failed to fetch consumer group info by \"\n                                 .. \"consumer group id [\" .. conf.group_id .. \"]: \"\n                                 .. err}\n    end\n\n    if res.status ~= 200 then\n        return nil, {error_msg = \"failed to fetch consumer group info by \"\n                                 .. \"consumer group id [\" .. conf.group_id .. \"], \"\n                                 .. \"response code: \" .. res.status}\n    end\nend",
+    "return_value": "conf.username"
+  },
+  "encrypt_conf": {
+    "args": "id, conf",
+    "custom_logic": "plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)"
+  }
+}

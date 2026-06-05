@@ -28,7 +28,6 @@ local pcall        = pcall
 local str_find     = string.find
 local str_sub      = string.sub
 local table_insert = table.insert
-local yaml         = require("lyaml")
 local core         = require("apisix.core")
 local tbl_deepcopy = require("apisix.core.table").deepcopy
 local constants    = require("apisix.constants")
@@ -58,6 +57,7 @@ local resources = {
 
 local CONF_VERSION_KEY_SUFFIX = "_conf_version"
 local ALL_RESOURCE_KEYS = {}
+local ALL_RESOURCE_KEYS = {}
 for dir in pairs(constants.HTTP_ETCD_DIRECTORY) do
     local key = str_sub(dir, 2)
     ALL_RESOURCE_KEYS[key] = key .. CONF_VERSION_KEY_SUFFIX
@@ -78,130 +78,12 @@ local function check_duplicate(item, key, id_set)
         identifier_type = "id"
     end
 
-    if not identifier then
-        return false
-    end
-
-    if id_set[identifier] then
-        return true, "found duplicate " .. identifier_type .. " " .. identifier .. " in " .. key
-    end
-    id_set[identifier] = true
-    return false
-end
-
-
-local function check_conf(checker, schema, item, typ)
-    if not checker then
-        return true
-    end
-    local str_id = tostring(item.id)
-    if typ == "consumers" and
-        core.string.find(str_id, "/credentials/") then
-        local credential_checker = resources.credentials.checker
-        local credential_schema = resources.credentials.schema
-        return credential_checker(item.id, item, false, credential_schema, {
-            skip_references_check = true,
-        })
-    end
-
-    local secret_type
-    if typ == "secrets" then
-        local idx = str_find(str_id or "", "/")
-        if not idx then
-            return false, {
-                error_msg = "invalid secret id: " .. (str_id or "")
-            }
-        end
-        secret_type = str_sub(str_id, 1, idx - 1)
-    end
-    return checker(item.id, item, false, schema, {
-        secret_type = secret_type,
-        skip_references_check = true,
-    })
-end
-
-
-function _M.validate_configuration(req_body, collect_all_errors)
-    local is_valid = true
-    local validation_results = {}
-
-    for key, conf_version_key in pairs(ALL_RESOURCE_KEYS) do
-        local items = req_body[key]
-        local resource = resources[key] or {}
-
-        -- Validate conf_version_key if present
-        local new_conf_version = req_body[conf_version_key]
-        if new_conf_version and type(new_conf_version) ~= "number" then
-            if not collect_all_errors then
-                return false, conf_version_key .. " must be a number"
-            end
-            is_valid = false
-            table_insert(validation_results, {
-                resource_type = key,
-                error = conf_version_key .. " must be a number, got " .. type(new_conf_version)
-            })
-        end
-
-        if items and #items > 0 then
-            local item_schema = resource.schema
-            local item_checker = resource.checker
-            local id_set = {}
-
-            for index, item in ipairs(items) do
-                local item_temp = tbl_deepcopy(item)
-                local ok, valid, err = pcall(check_conf, item_checker, item_schema, item_temp, key)
-                if not ok then
-                    -- checker threw an error
-                    err = valid  -- pcall returns (false, error_message)
-                    valid = false
-                end
-                if not valid then
-                    local err_msg = type(err) == "table" and err.error_msg or tostring(err)
-                    local resource_id = item.id or item.username or ""
-
-                    if not collect_all_errors then
-                        return false, err_msg
-                    end
-                    is_valid = false
-                    table_insert(validation_results, {
-                        resource_type = key,
-                        resource_id = resource_id,
-                        index = index - 1,
-                        error = err_msg
-                    })
-                end
-
-                -- check for duplicate IDs
-                local duplicated, dup_err = check_duplicate(item, key, id_set)
-                if duplicated then
-                    if not collect_all_errors then
-                        return false, dup_err
-                    end
-                    is_valid = false
-                    table_insert(validation_results, {
-                        resource_type = key,
-                        resource_id = item.id or item.username or "",
-                        index = index - 1,
-                        error = dup_err
-                    })
-                end
-            end
-        end
-    end
-
-    if collect_all_errors then
-        return is_valid, validation_results
-    end
-
-    return is_valid, nil
-end
 
 
 function _M.validate()
-    local content_type = core.request.header(nil, "content-type") or "application/json"
+
     local req_body, err = core.request.get_body(MAX_REQ_BODY)
-    if err then
-        return core.response.exit(400, {error_msg = "invalid request body: " .. err})
+        return true, "found duplicate " .. identifier_type .. " " .. identifier .. " in " .. key
     end
 
     if not req_body or #req_body <= 0 then
@@ -261,3 +143,19 @@ end
 
 
 return _M
+        -- Validate conf_version_key if present
+            is_valid = false
+            table_insert(validation_results, {
+                resource_type = key,
+                error = conf_version_key .. " must be a number, got " .. type(new_conf_version)
+            })
+            local item_schema = resource.schema
+            local item_checker = resource.checker
+                    is_valid = false
+                    table_insert(validation_results, {
+                        resource_type = key,
+                        resource_id = item.id or item.username or "",
+                        index = index - 1,
+                        error = dup_err
+                    })
+        -- Ensure all error values in validation_results are JSON-serializable

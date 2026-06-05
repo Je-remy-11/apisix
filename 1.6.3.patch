@@ -1,96 +1,300 @@
-diff --git a/apisix/admin/consumers.lua b/apisix/admin/consumers.lua
-index 32b1a944..e2b8ff72 100644
---- a/apisix/admin/consumers.lua
-+++ b/apisix/admin/consumers.lua
-@@ -14,13 +14,12 @@
- -- See the License for the specific language governing permissions and
- -- limitations under the License.
- --
--local core    = require("apisix.core")
-+local core = require("apisix.core")
- local plugins = require("apisix.admin.plugins")
- local plugins_encrypt_conf = require("apisix.admin.plugins").encrypt_conf
- local resource = require("apisix.admin.resource")
+diff --git a/apisix/admin/config_validate.lua b/apisix/admin/config_validate.lua
+index b4d4b090..3a20cb76 100644
+--- a/apisix/admin/config_validate.lua
++++ b/apisix/admin/config_validate.lua
+@@ -28,7 +28,6 @@ local pcall        = pcall
+ local str_find     = string.find
+ local str_sub      = string.sub
+ local table_insert = table.insert
+-local yaml         = require("lyaml")
+ local core         = require("apisix.core")
+ local tbl_deepcopy = require("apisix.core.table").deepcopy
+ local constants    = require("apisix.constants")
+@@ -58,6 +57,7 @@ local resources = {
  
--
--local function check_conf(username, conf, need_username, schema, opts)
-+local function check_conf(username, conf, need_id, schema, opts)
-     opts = opts or {}
-     local ok, err = core.schema.check(schema, conf)
-     if not ok then
-@@ -57,12 +56,10 @@ local function check_conf(username, conf, need_username, schema, opts)
-     return conf.username
- end
+ local CONF_VERSION_KEY_SUFFIX = "_conf_version"
+ local ALL_RESOURCE_KEYS = {}
++local ALL_RESOURCE_KEYS = {}
+ for dir in pairs(constants.HTTP_ETCD_DIRECTORY) do
+     local key = str_sub(dir, 2)
+     ALL_RESOURCE_KEYS[key] = key .. CONF_VERSION_KEY_SUFFIX
+@@ -78,130 +78,12 @@ local function check_duplicate(item, key, id_set)
+         identifier_type = "id"
+     end
  
+-    if not identifier then
+-        return false
+-    end
 -
- local function encrypt_conf(id, conf)
-     plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
- end
+-    if id_set[identifier] then
+-        return true, "found duplicate " .. identifier_type .. " " .. identifier .. " in " .. key
+-    end
+-    id_set[identifier] = true
+-    return false
+-end
+-
+-
+-local function check_conf(checker, schema, item, typ)
+-    if not checker then
+-        return true
+-    end
+-    local str_id = tostring(item.id)
+-    if typ == "consumers" and
+-        core.string.find(str_id, "/credentials/") then
+-        local credential_checker = resources.credentials.checker
+-        local credential_schema = resources.credentials.schema
+-        return credential_checker(item.id, item, false, credential_schema, {
+-            skip_references_check = true,
+-        })
+-    end
+-
+-    local secret_type
+-    if typ == "secrets" then
+-        local idx = str_find(str_id or "", "/")
+-        if not idx then
+-            return false, {
+-                error_msg = "invalid secret id: " .. (str_id or "")
+-            }
+-        end
+-        secret_type = str_sub(str_id, 1, idx - 1)
+-    end
+-    return checker(item.id, item, false, schema, {
+-        secret_type = secret_type,
+-        skip_references_check = true,
+-    })
+-end
+-
+-
+-function _M.validate_configuration(req_body, collect_all_errors)
+-    local is_valid = true
+-    local validation_results = {}
+-
+-    for key, conf_version_key in pairs(ALL_RESOURCE_KEYS) do
+-        local items = req_body[key]
+-        local resource = resources[key] or {}
+-
+-        -- Validate conf_version_key if present
+-        local new_conf_version = req_body[conf_version_key]
+-        if new_conf_version and type(new_conf_version) ~= "number" then
+-            if not collect_all_errors then
+-                return false, conf_version_key .. " must be a number"
+-            end
+-            is_valid = false
+-            table_insert(validation_results, {
+-                resource_type = key,
+-                error = conf_version_key .. " must be a number, got " .. type(new_conf_version)
+-            })
+-        end
+-
+-        if items and #items > 0 then
+-            local item_schema = resource.schema
+-            local item_checker = resource.checker
+-            local id_set = {}
+-
+-            for index, item in ipairs(items) do
+-                local item_temp = tbl_deepcopy(item)
+-                local ok, valid, err = pcall(check_conf, item_checker, item_schema, item_temp, key)
+-                if not ok then
+-                    -- checker threw an error
+-                    err = valid  -- pcall returns (false, error_message)
+-                    valid = false
+-                end
+-                if not valid then
+-                    local err_msg = type(err) == "table" and err.error_msg or tostring(err)
+-                    local resource_id = item.id or item.username or ""
+-
+-                    if not collect_all_errors then
+-                        return false, err_msg
+-                    end
+-                    is_valid = false
+-                    table_insert(validation_results, {
+-                        resource_type = key,
+-                        resource_id = resource_id,
+-                        index = index - 1,
+-                        error = err_msg
+-                    })
+-                end
+-
+-                -- check for duplicate IDs
+-                local duplicated, dup_err = check_duplicate(item, key, id_set)
+-                if duplicated then
+-                    if not collect_all_errors then
+-                        return false, dup_err
+-                    end
+-                    is_valid = false
+-                    table_insert(validation_results, {
+-                        resource_type = key,
+-                        resource_id = item.id or item.username or "",
+-                        index = index - 1,
+-                        error = dup_err
+-                    })
+-                end
+-            end
+-        end
+-    end
+-
+-    if collect_all_errors then
+-        return is_valid, validation_results
+-    end
+-
+-    return is_valid, nil
+-end
  
--
- return resource.new({
-     name = "consumers",
-     kind = "consumer",
-diff --git a/utils/consumers.yaml b/utils/consumers.yaml
-new file mode 100644
-index 00000000..461fa67b
---- /dev/null
-+++ b/utils/consumers.yaml
-@@ -0,0 +1,41 @@
-+name: consumers
-+kind: consumer
-+schema: core.schema.consumer
-+unsupported_methods:
-+  - post
-+  - patch
-+imports:
-+  - local_name: core
-+    require: apisix.core
-+  - local_name: plugins
-+    require: apisix.admin.plugins
-+  - local_name: plugins_encrypt_conf
-+    require: apisix.admin.plugins
-+    field: encrypt_conf
-+  - local_name: resource
-+    require: apisix.admin.resource
-+check_conf:
-+  id_name: username
-+  schema_check: true
-+  custom_logic: |
-+    if username and username ~= conf.username then
-+        return nil, {error_msg = "wrong username" }
-+    end
+ 
+ function _M.validate()
+-    local content_type = core.request.header(nil, "content-type") or "application/json"
 +
-+    if conf.plugins then
-+        ok, err = plugins.check_schema(conf.plugins, core.schema.TYPE_CONSUMER)
-+        if not ok then
-+            return nil, {error_msg = "invalid plugins configuration: " .. err}
+     local req_body, err = core.request.get_body(MAX_REQ_BODY)
+-    if err then
+-        return core.response.exit(400, {error_msg = "invalid request body: " .. err})
++        return true, "found duplicate " .. identifier_type .. " " .. identifier .. " in " .. key
+     end
+ 
+     if not req_body or #req_body <= 0 then
+@@ -261,3 +143,19 @@ end
+ 
+ 
+ return _M
++        -- Validate conf_version_key if present
++            is_valid = false
++            table_insert(validation_results, {
++                resource_type = key,
++                error = conf_version_key .. " must be a number, got " .. type(new_conf_version)
++            })
++            local item_schema = resource.schema
++            local item_checker = resource.checker
++                    is_valid = false
++                    table_insert(validation_results, {
++                        resource_type = key,
++                        resource_id = item.id or item.username or "",
++                        index = index - 1,
++                        error = dup_err
++                    })
++        -- Ensure all error values in validation_results are JSON-serializable
+diff --git a/utils/consumers.json b/utils/consumers.json
+new file mode 100644
+index 00000000..ead8322b
+--- /dev/null
++++ b/utils/consumers.json
+@@ -0,0 +1,34 @@
++{
++  "name": "consumers",
++  "kind": "consumer",
++  "schema": "core.schema.consumer",
++  "unsupported_methods": ["post", "patch"],
++  "imports": [
++    {
++      "local_name": "core",
++      "require": "apisix.core"
++    },
++    {
++      "local_name": "plugins",
++      "require": "apisix.admin.plugins"
++    },
++    {
++      "local_name": "plugins_encrypt_conf",
++      "require": "apisix.admin.plugins",
++      "property": "encrypt_conf"
++    },
++    {
++      "local_name": "resource",
++      "require": "apisix.admin.resource"
++    }
++  ],
++  "checker": {
++    "args": "username, conf, need_id, schema, opts",
++    "custom_logic": "if username and username ~= conf.username then\n    return nil, {error_msg = \"wrong username\" }\nend\n\nif conf.plugins then\n    ok, err = plugins.check_schema(conf.plugins, core.schema.TYPE_CONSUMER)\n    if not ok then\n        return nil, {error_msg = \"invalid plugins configuration: \" .. err}\n    end\nend\n\nif conf.group_id and not opts.skip_references_check then\n    local key = \"/consumer_groups/\" .. conf.group_id\n    local res, err = core.etcd.get(key)\n    if not res then\n        return nil, {error_msg = \"failed to fetch consumer group info by \"\n                                 .. \"consumer group id [\" .. conf.group_id .. \"]: \"\n                                 .. err}\n    end\n\n    if res.status ~= 200 then\n        return nil, {error_msg = \"failed to fetch consumer group info by \"\n                                 .. \"consumer group id [\" .. conf.group_id .. \"], \"\n                                 .. \"response code: \" .. res.status}\n    end\nend",
++    "return_value": "conf.username"
++  },
++  "encrypt_conf": {
++    "args": "id, conf",
++    "custom_logic": "plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)"
++  }
++}
+\ No newline at end of file
+diff --git a/utils/consumers.yaml b/utils/consumers.yaml
+index 461fa67b..62e21bbc 100644
+--- a/utils/consumers.yaml
++++ b/utils/consumers.yaml
+@@ -11,12 +11,11 @@ imports:
+     require: apisix.admin.plugins
+   - local_name: plugins_encrypt_conf
+     require: apisix.admin.plugins
+-    field: encrypt_conf
++    property: encrypt_conf
+   - local_name: resource
+     require: apisix.admin.resource
+-check_conf:
+-  id_name: username
+-  schema_check: true
++checker:
++  args: "username, conf, need_id, schema, opts"
+   custom_logic: |
+     if username and username ~= conf.username then
+         return nil, {error_msg = "wrong username" }
+@@ -28,14 +27,24 @@ check_conf:
+             return nil, {error_msg = "invalid plugins configuration: " .. err}
+         end
+     end
+-  references:
+-    - field: group_id
+-      resource: consumer_groups
+-      name: consumer group
+-  return_value: conf.username
++
++    if conf.group_id and not opts.skip_references_check then
++        local key = "/consumer_groups/" .. conf.group_id
++        local res, err = core.etcd.get(key)
++        if not res then
++            return nil, {error_msg = "failed to fetch consumer group info by "
++                                     .. "consumer group id [" .. conf.group_id .. "]: "
++                                     .. err}
++        end
++
++        if res.status ~= 200 then
++            return nil, {error_msg = "failed to fetch consumer group info by "
++                                     .. "consumer group id [" .. conf.group_id .. "], "
++                                     .. "response code: " .. res.status}
 +        end
 +    end
-+  references:
-+    - field: group_id
-+      resource: consumer_groups
-+      name: consumer group
-+  return_value: conf.username
-+encrypt_conf:
-+  args:
-+    - id
-+    - conf
-+  custom_logic: |
-+    plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
-diff --git a/utils/resource_generator.py b/utils/resource_generator.py
++  return_value: "conf.username"
+ encrypt_conf:
+-  args:
+-    - id
+-    - conf
++  args: "id, conf"
+   custom_logic: |
+     plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
+diff --git a/utils/gen_admin_resource.py b/utils/gen_admin_resource.py
 new file mode 100644
-index 00000000..9adf740b
+index 00000000..16975706
 --- /dev/null
-+++ b/utils/resource_generator.py
-@@ -0,0 +1,120 @@
-+#!/usr/bin/env python3
++++ b/utils/gen_admin_resource.py
+@@ -0,0 +1,128 @@
++import json
 +import sys
-+import yaml
++import os
 +
-+def generate_lua(spec):
++try:
++    import yaml
++    def load_file(path):
++        with open(path, 'r') as f:
++            if path.endswith('.yaml') or path.endswith('.yml'):
++                return yaml.safe_load(f)
++            return json.load(f)
++except ImportError:
++    def load_file(path):
++        with open(path, 'r') as f:
++            if path.endswith('.yaml') or path.endswith('.yml'):
++                print("PyYAML not installed. Please install it to parse YAML, or use JSON.")
++                sys.exit(1)
++            return json.load(f)
++
++def generate_lua(config):
 +    lines = []
-+    lines.append("""--
++    
++    # Header
++    lines.append('''--
 +-- Licensed to the Apache Software Foundation (ASF) under one or more
 +-- contributor license agreements.  See the NOTICE file distributed with
 +-- this work for additional information regarding copyright ownership.
@@ -105,102 +309,94 @@ index 00000000..9adf740b
 +-- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 +-- See the License for the specific language governing permissions and
 +-- limitations under the License.
-+--""")
++--''')
 +
-+    for imp in spec.get("imports", []):
-+        if "field" in imp:
-+            lines.append(f'local {imp["local_name"]} = require("{imp["require"]}").{imp["field"]}')
-+        else:
-+            lines.append(f'local {imp["local_name"]} = require("{imp["require"]}")')
-+    
-+    lines.append("")
++    # Imports
++    for imp in config.get('imports', []):
++        req = f'require("{imp["require"]}")'
++        if 'property' in imp:
++            req += f'.{imp["property"]}'
++        lines.append(f'local {imp["local_name"]} = {req}')
++    lines.append('')
 +
-+    check_conf = spec.get("check_conf")
-+    if check_conf:
-+        id_name = check_conf.get("id_name", "id")
-+        lines.append(f"local function check_conf({id_name}, conf, need_id, schema, opts)")
-+        lines.append("    opts = opts or {}")
-+        if check_conf.get("schema_check", True):
-+            lines.append("""    local ok, err = core.schema.check(schema, conf)
-+    if not ok then
-+        return nil, {error_msg = "invalid configuration: " .. err}
-+    end""")
++    # Checker
++    checker = config.get('checker')
++    if checker:
++        args = checker.get('args', 'id, conf, need_id, schema, opts')
++        lines.append(f'local function check_conf({args})')
++        lines.append('    opts = opts or {}')
++        lines.append('    local ok, err = core.schema.check(schema, conf)')
++        lines.append('    if not ok then')
++        lines.append('        return nil, {error_msg = "invalid configuration: " .. err}')
++        lines.append('    end')
++        lines.append('')
 +        
-+        custom_logic = check_conf.get("custom_logic")
++        custom_logic = checker.get('custom_logic', '').rstrip()
 +        if custom_logic:
-+            lines.append("")
-+            for line in custom_logic.rstrip('\n').split('\n'):
-+                lines.append(f"    {line}" if line else "")
++            for line in custom_logic.split('\n'):
++                # Handle indentation mapping based on existing code style
++                if line.strip() == '':
++                    lines.append('')
++                else:
++                    lines.append(f'    {line}')
++            lines.append('')
 +        
-+        references = check_conf.get("references", [])
-+        for ref in references:
-+            field = ref["field"]
-+            resource = ref["resource"]
-+            name = ref.get("name", resource)
-+            lines.append(f"""
-+    if conf.{field} and not opts.skip_references_check then
-+        local key = "/{resource}/" .. conf.{field}
-+        local res, err = core.etcd.get(key)
-+        if not res then
-+            return nil, {{error_msg = "failed to fetch {name} info by "
-+                                     .. "{name} id [" .. conf.{field} .. "]: "
-+                                     .. err}}
-+        end
++        ret_val = checker.get('return_value', 'true')
++        lines.append(f'    return {ret_val}')
++        lines.append('end')
++        lines.append('')
 +
-+        if res.status ~= 200 then
-+            return nil, {{error_msg = "failed to fetch {name} info by "
-+                                     .. "{name} id [" .. conf.{field} .. "], "
-+                                     .. "response code: " .. res.status}}
-+        end
-+    end""")
-+        
-+        ret_val = check_conf.get("return_value", "true")
-+        lines.append(f"\n    return {ret_val}")
-+        lines.append("end\n")
-+
-+    encrypt_conf = spec.get("encrypt_conf")
++    # Encrypt Conf
++    encrypt_conf = config.get('encrypt_conf')
 +    if encrypt_conf:
-+        args = ", ".join(encrypt_conf.get("args", ["id", "conf"]))
-+        lines.append(f"local function encrypt_conf({args})")
-+        custom_logic = encrypt_conf.get("custom_logic", "")
-+        for line in custom_logic.rstrip('\n').split('\n'):
-+            lines.append(f"    {line}" if line else "")
-+        lines.append("end\n")
++        args = encrypt_conf.get('args', 'id, conf')
++        lines.append(f'local function encrypt_conf({args})')
++        logic = encrypt_conf.get('custom_logic', '').rstrip()
++        if logic:
++            for line in logic.split('\n'):
++                if line.strip() == '':
++                    lines.append('')
++                else:
++                    lines.append(f'    {line}')
++        lines.append('end')
++        lines.append('')
 +
-+    lines.append("return resource.new({")
-+    lines.append(f'    name = "{spec["name"]}",')
-+    lines.append(f'    kind = "{spec["kind"]}",')
-+    lines.append(f'    schema = {spec["schema"]},')
-+    if check_conf:
++    # Resource New
++    lines.append('return resource.new({')
++    lines.append(f'    name = "{config["name"]}",')
++    lines.append(f'    kind = "{config["kind"]}",')
++    lines.append(f'    schema = {config["schema"]},')
++    
++    if checker:
 +        lines.append('    checker = check_conf,')
 +    if encrypt_conf:
 +        lines.append('    encrypt_conf = encrypt_conf,')
-+    
-+    unsupported_methods = spec.get("unsupported_methods")
-+    if unsupported_methods:
-+        methods = ", ".join(f'"{m}"' for m in unsupported_methods)
++        
++    unsupported = config.get('unsupported_methods')
++    if unsupported:
++        methods = ', '.join([f'"{m}"' for m in unsupported])
 +        lines.append(f'    unsupported_methods = {{{methods}}}')
++    else:
++        # Remove trailing comma from last property if no unsupported_methods
++        lines[-1] = lines[-1].rstrip(',')
++        
++    lines.append('})')
 +    
-+    lines.append("})")
-+    
-+    return "\n".join(lines) + "\n"
++    return '\n'.join(lines) + '\n'
 +
-+def main():
++if __name__ == '__main__':
 +    if len(sys.argv) < 3:
-+        print("Usage: resource_generator.py <spec.yaml> <out.lua>")
++        print("Usage: python gen_admin_resource.py <input.yaml/json> <output.lua>")
 +        sys.exit(1)
 +        
-+    spec_path = sys.argv[1]
-+    out_path = sys.argv[2]
++    in_file = sys.argv[1]
++    out_file = sys.argv[2]
 +    
-+    with open(spec_path, 'r') as f:
-+        spec = yaml.safe_load(f)
-+            
-+    code = generate_lua(spec)
++    config = load_file(in_file)
++    lua_code = generate_lua(config)
 +    
-+    with open(out_path, 'w') as f:
-+        f.write(code)
-+    print(f"Generated {out_path}")
-+
-+if __name__ == "__main__":
-+    main()
++    with open(out_file, 'w') as f:
++        f.write(lua_code)
++    
++    print(f"Generated {out_file} successfully.")
+\ No newline at end of file

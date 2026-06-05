@@ -11,12 +11,11 @@ imports:
     require: apisix.admin.plugins
   - local_name: plugins_encrypt_conf
     require: apisix.admin.plugins
-    field: encrypt_conf
+    property: encrypt_conf
   - local_name: resource
     require: apisix.admin.resource
-check_conf:
-  id_name: username
-  schema_check: true
+checker:
+  args: "username, conf, need_id, schema, opts"
   custom_logic: |
     if username and username ~= conf.username then
         return nil, {error_msg = "wrong username" }
@@ -28,14 +27,24 @@ check_conf:
             return nil, {error_msg = "invalid plugins configuration: " .. err}
         end
     end
-  references:
-    - field: group_id
-      resource: consumer_groups
-      name: consumer group
-  return_value: conf.username
+
+    if conf.group_id and not opts.skip_references_check then
+        local key = "/consumer_groups/" .. conf.group_id
+        local res, err = core.etcd.get(key)
+        if not res then
+            return nil, {error_msg = "failed to fetch consumer group info by "
+                                     .. "consumer group id [" .. conf.group_id .. "]: "
+                                     .. err}
+        end
+
+        if res.status ~= 200 then
+            return nil, {error_msg = "failed to fetch consumer group info by "
+                                     .. "consumer group id [" .. conf.group_id .. "], "
+                                     .. "response code: " .. res.status}
+        end
+    end
+  return_value: "conf.username"
 encrypt_conf:
-  args:
-    - id
-    - conf
+  args: "id, conf"
   custom_logic: |
     plugins_encrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
