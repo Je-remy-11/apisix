@@ -1,11 +1,109 @@
 diff --git a/apisix/admin/consumers.lua b/apisix/admin/consumers.lua
-index 32b1a944..7f3c77f7 100644
+index 7f3c77f7..0926b82e 100644
 --- a/apisix/admin/consumers.lua
 +++ b/apisix/admin/consumers.lua
-@@ -69,5 +69,5 @@ return resource.new({
+@@ -17,6 +17,7 @@
+ local core    = require("apisix.core")
+ local plugins = require("apisix.admin.plugins")
+ local plugins_encrypt_conf = require("apisix.admin.plugins").encrypt_conf
++local plugins_decrypt_conf = require("apisix.admin.plugins").decrypt_conf
+ local resource = require("apisix.admin.resource")
+ 
+ 
+@@ -63,11 +64,17 @@ local function encrypt_conf(id, conf)
+ end
+ 
+ 
++local function decrypt_conf(id, conf)
++    plugins_decrypt_conf(conf.plugins, core.schema.TYPE_CONSUMER)
++end
++
++
+ return resource.new({
+     name = "consumers",
+     kind = "consumer",
      schema = core.schema.consumer,
      checker = check_conf,
      encrypt_conf = encrypt_conf,
--    unsupported_methods = {"post", "patch"}
-+    unsupported_methods = {"post"}
++    decrypt_conf = decrypt_conf,
+     unsupported_methods = {"post"}
  })
+diff --git a/apisix/admin/plugins.lua b/apisix/admin/plugins.lua
+index 8494c11c..548ef97d 100644
+--- a/apisix/admin/plugins.lua
++++ b/apisix/admin/plugins.lua
+@@ -25,6 +25,7 @@ local plugin_get_all = require("apisix.plugin").get_all
+ local plugin_get_http = require("apisix.plugin").get
+ local plugin_get_stream = require("apisix.plugin").get_stream
+ local encrypt_conf = require("apisix.plugin").encrypt_conf
++local decrypt_conf = require("apisix.plugin").decrypt_conf
+ local pairs = pairs
+ 
+ local _M = {}
+@@ -44,6 +45,15 @@ function _M.encrypt_conf(plugins_conf, schema_type)
+ end
+ 
+ 
++function _M.decrypt_conf(plugins_conf, schema_type)
++    if plugins_conf then
++        for name, conf in pairs(plugins_conf) do
++            decrypt_conf(name, conf, schema_type)
++        end
++    end
++end
++
++
+ function _M.get(name)
+     local arg = get_uri_args()
+     -- If subsystem is passed inside args then it should be oneOf: http / stream.
+diff --git a/apisix/admin/resource.lua b/apisix/admin/resource.lua
+index 87c5692f..192812e4 100644
+--- a/apisix/admin/resource.lua
++++ b/apisix/admin/resource.lua
+@@ -422,6 +422,10 @@ function _M:patch(id, conf, sub_path, args)
+     local modified_index = res_old.body.node.modifiedIndex
+ 
+     if sub_path and sub_path ~= "" then
++        if self.decrypt_conf then
++            self.decrypt_conf(id, node_value)
++        end
++
+         if self.name == "ssls" then
+             if sub_path == "key" then
+                 conf = apisix_ssl.aes_encrypt_pkey(conf)
+@@ -431,6 +435,7 @@ function _M:patch(id, conf, sub_path, args)
+                 end
+             end
+         end
++
+         local code, err, node_val = core.table.patch(node_value, sub_path, conf)
+         node_value = node_val
+         if code then
+@@ -449,7 +454,17 @@ function _M:patch(id, conf, sub_path, args)
+                 end
+             end
+         end
++
++        if self.decrypt_conf then
++            self.decrypt_conf(id, node_value)
++        end
++
+         node_value = core.table.merge(node_value, conf)
++
++        if self.name == "consumers" and conf.username and conf.username ~= id then
++            return 400, {error_msg = "cannot change username via PATCH"}
++        end
++
+         utils.inject_timestamp(node_value, nil, conf)
+     end
+ 
+@@ -468,6 +483,9 @@ function _M:patch(id, conf, sub_path, args)
+     local res, err = core.etcd.atomic_set(key, node_value, ttl, modified_index)
+     if not res then
+         core.log.error("failed to set new ", self.kind, "[", key, "] to etcd: ", err)
++        if err and string.find(err, "compare failed") then
++            return 409, {error_msg = "conflict: resource was modified by another request"}
++        end
+         return 503, {error_msg = err}
+     end
+ 

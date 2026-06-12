@@ -422,6 +422,10 @@ function _M:patch(id, conf, sub_path, args)
     local modified_index = res_old.body.node.modifiedIndex
 
     if sub_path and sub_path ~= "" then
+        if self.decrypt_conf then
+            self.decrypt_conf(id, node_value)
+        end
+
         if self.name == "ssls" then
             if sub_path == "key" then
                 conf = apisix_ssl.aes_encrypt_pkey(conf)
@@ -431,6 +435,7 @@ function _M:patch(id, conf, sub_path, args)
                 end
             end
         end
+
         local code, err, node_val = core.table.patch(node_value, sub_path, conf)
         node_value = node_val
         if code then
@@ -449,7 +454,17 @@ function _M:patch(id, conf, sub_path, args)
                 end
             end
         end
+
+        if self.decrypt_conf then
+            self.decrypt_conf(id, node_value)
+        end
+
         node_value = core.table.merge(node_value, conf)
+
+        if self.name == "consumers" and conf.username and conf.username ~= id then
+            return 400, {error_msg = "cannot change username via PATCH"}
+        end
+
         utils.inject_timestamp(node_value, nil, conf)
     end
 
@@ -468,6 +483,9 @@ function _M:patch(id, conf, sub_path, args)
     local res, err = core.etcd.atomic_set(key, node_value, ttl, modified_index)
     if not res then
         core.log.error("failed to set new ", self.kind, "[", key, "] to etcd: ", err)
+        if err and string.find(err, "compare failed") then
+            return 409, {error_msg = "conflict: resource was modified by another request"}
+        end
         return 503, {error_msg = err}
     end
 
